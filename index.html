@@ -4103,6 +4103,16 @@ var ViewReport = {
       '</span></div>';
   },
 
+  sharedBar: function (rep) {
+    return '<div class="report-toolbar">' +
+      '<span class="eyebrow mint">' + icon('link') + '공유 보기</span>' +
+      '<span class="rt-note">' + U.esc(rep.store) + ' · ' + U.esc(rep.period) + '</span>' +
+      '<span style="margin-left:auto;display:flex;gap:6px">' +
+        '<button class="btn btn-ghost btn-sm" type="button" data-act="mode" data-mode="explore">캠페인 보기</button>' +
+        '<button class="btn btn-ink btn-sm" type="button" data-act="printReport">' + icon('print') + 'PDF 저장 / 인쇄</button>' +
+      '</span></div>';
+  },
+
   kpis: function (t) {
     var items = [
       { lab: '참여 블로거', v: t.posts, unit: '명', em: '발행 포스팅 ' + t.posts + '건' },
@@ -4256,7 +4266,7 @@ var ViewReport = {
     var cid = App.reportCampaign || 'CMP-001';
     var rep = ViewReport.build(cid);
     App.reportData = rep;
-    if (!Store.isAdmin()) {
+    if (!Store.isAdmin() && !App.reportShared) {
       return '<div class="wrap"><div class="page-head"><div class="crumb"><b>성과 보고서</b></div>' +
         '<h1 class="h1">클라이언트 성과 보고서</h1></div><section class="sec" style="padding-top:18px">' +
         '<div class="panel" style="padding:clamp(22px,4vw,40px);text-align:center">' +
@@ -4268,9 +4278,11 @@ var ViewReport = {
     }
     return '<div class="wrap report-wrap">' +
       '<div class="page-head"><div class="crumb"><b>성과 보고서</b><span>/</span><span>' + U.esc(rep.store) + '</span></div>' +
-        '<h1 class="h1">클라이언트용 월간 성과 보고서</h1>' +
-        '<p class="lede">캠페인을 고르면 참여 체험단·포스팅 성과·키워드 노출·인사이트를 A4 한 장 구성으로 자동 생성합니다. 내부 수정요청·검수 실패 내역은 보고서에 넣지 않습니다.</p></div>' +
-      '<section class="sec" style="padding-top:16px">' + ViewReport.toolbar(rep) +
+        '<h1 class="h1">' + (App.reportShared && !Store.isAdmin() ? '공유된 성과 보고서' : '클라이언트용 월간 성과 보고서') + '</h1>' +
+        '<p class="lede">' + (App.reportShared && !Store.isAdmin()
+          ? U.esc(rep.store) + ' · ' + U.esc(rep.period) + ' 성과 보고서입니다. 인쇄하거나 PDF로 저장할 수 있습니다.'
+          : '캠페인을 고르면 참여 체험단·포스팅 성과·키워드 노출·인사이트를 A4 한 장 구성으로 자동 생성합니다. 내부 수정요청·검수 실패 내역은 보고서에 넣지 않습니다.') + '</p></div>' +
+      '<section class="sec" style="padding-top:16px">' + (Store.isAdmin() ? ViewReport.toolbar(rep) : ViewReport.sharedBar(rep)) +
         (Store.state.reports.length ? '<p class="tiny" style="margin:-6px 0 12px">저장된 스냅샷 ' + Store.state.reports.length + '건 · 최근 ' +
           U.fmtFull(Store.state.reports[0].at) + ' ' + U.esc(Store.state.reports[0].store) + '</p>' : '') +
         ViewReport.sheet(rep) +
@@ -4300,6 +4312,7 @@ var App = {
   indexResult: null,
   reportCampaign: 'CMP-001',
   reportData: null,
+  reportShared: false,
   _inspectTimer: null,
   _searchTimer: null,
   _toastTimer: null,
@@ -4314,7 +4327,7 @@ var App = {
       Store.state.ui.mode = 'admin'; Store.state.ui.adminTab = U.qs('tab');
     }
     if (U.qs('mytab')) Store.state.ui.myTab = U.qs('mytab');
-    if (U.qs('report')) this.reportCampaign = U.qs('report');
+    if (U.qs('report')) { App.reportCampaign = U.qs('report'); App.reportShared = U.qs('mode') === 'report'; }
     if (U.qs('blog')) Store.state.ui.lastIndex = U.qs('blog');
     App.bind();
     App.render();
