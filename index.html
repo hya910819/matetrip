@@ -1884,15 +1884,29 @@ var DB = {
       return null;
     });
   },
+  isUuid: function (v) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+  },
   insert: function (table, row) {
     if (!DB.client) return Promise.resolve(null);
-    return DB.client.from(table).insert(row).select().then(function (r) {
+    /* uuid 기본키를 쓰는 테이블은 uuid 가 아닌 값(데모 ID)을 보내면 400 이 납니다. */
+    var clean = {};
+    Object.keys(row || {}).forEach(function (k) {
+      var v = row[k];
+      if (k === 'creator_id' || k === 'application_id') { if (DB.isUuid(v)) clean[k] = v; return; }
+      if (k === 'campaign_id' && table !== 'campaigns' && !v) return;
+      clean[k] = v;
+    });
+    return DB.client.from(table).insert(clean).select().then(function (r) {
       if (r.error) { DB.lastError = r.error.message; return null; }
       return (r.data && r.data[0]) || null;
     }).catch(function (e) { DB.lastError = String(e && e.message || e); return null; });
   },
   update: function (table, id, patch) {
     if (!DB.client) return Promise.resolve(null);
+    if (!id) return Promise.resolve(null);
+    /* applications·reviews·monthly_reports 는 uuid PK — 데모 ID 로는 수정 요청을 보내지 않는다. */
+    if (table !== 'campaigns' && !DB.isUuid(id)) return Promise.resolve(null);
     return DB.client.from(table).update(patch).eq('id', id).select().then(function (r) {
       if (r.error) { DB.lastError = r.error.message; return null; }
       return (r.data && r.data[0]) || null;
@@ -1984,7 +1998,18 @@ var Store = {
   capacityOf: function (c) {
     if (!c) return { capacity: 0, confirmed: 0 };
     var ov = Store.state.campaignState[c.id] || {};
-    return { capacity: ov.capacity != null ? ov.capacity : c.capacity, confirmed: c.confirmed };
+    return { capacity: ov.capacity != null ? ov.capacity : c.capacity,
+      confirmed: ov.confirmed != null ? ov.confirmed : c.confirmed };
+  },
+  /* 선정·반려로 확정 인원이 바뀌면 campaignState 에 오버라이드로 기록한다. */
+  bumpConfirmed: function (campaignId, delta) {
+    var c = Store.campaign(campaignId);
+    if (!c) return;
+    var cs = Store.state.campaignState[campaignId] || {};
+    var cur = cs.confirmed != null ? cs.confirmed : c.confirmed;
+    cs.confirmed = U.clamp(cur + delta, 0, 999);
+    Store.state.campaignState[campaignId] = cs;
+    Store.save();
   },
   appsOf: function (creatorId) { return Store.state.applications.filter(function (a) { return a.creatorId === creatorId; }); },
   appsOfCampaign: function (campaignId) { return Store.state.applications.filter(function (a) { return a.campaignId === campaignId; }); },
@@ -1999,6 +2024,91 @@ var Store = {
   },
   isAdmin: function () { return !!(Store.state.session && Store.state.session.role === 'admin'); },
   isLoggedIn: function () { return !!Store.state.session; },
+
+  /* ------------------------------------------- 신청 가드 · 방문 기간 · 가이드 -- */
+  visitRange: function (c) {
+    if (!c) return null;
+    var m = String(c.visitWindow || '').match(/(\d{1,2})\s*\/\s*(\d{1,2})\s*~\s*(\d{1,2})\s*\/\s*(\d{1,2})/);
+    if (!m) return null;
+    var y = U.today().getFullYear();
+    var a = new Date(y, +m[1] - 1, +m[2]);
+    var b = new Date(y, +m[3] - 1, +m[4]);
+    if (b < a) b = new Date(y + 1, +m[3] - 1, +m[4]);
+    return { min: U.iso(a), max: U.iso(b) };
+  },
+  myApplication: function (campaignId) {
+    var v = Store.viewer(); if (!v) return null;
+    return Store.state.applications.filter(function (a) {
+      return a.campaignId === campaignId && a.creatorId === v.id && !a.history
+        && a.status !== 'rejected' && a.status !== 'noshow';
+    })[0] || null;
+  },
+  /* 신청 버튼을 눌렀을 때의 차단 사유를 한 곳에서 판정한다. */
+  applyBlock: function (c) {
+    if (!c) return { code: 'none', msg: '캠페인을 찾을 수 없습니다.', label: '없음' };
+    var cs = Store.state.campaignState[c.id] || {};
+    if (c.status === 'ended') return { code: 'ended', msg: '종료된 캠페인입니다.', label: '종료' };
+    if (c.status === 'closed' || cs.paused) return { code: 'closed', msg: '모집이 마감되었습니다.', label: '모집 마감' };
+    if (U.dday(Store.deadline(c)).n < 0) return { code: 'closed', msg: '모집 기간이 끝났습니다.', label: '모집 마감' };
+    var cap = Store.capacityOf(c);
+    if (cap.confirmed >= cap.capacity) return { code: 'full', msg: '모집 인원이 모두 찼습니다. (대기 문의는 담당자에게)', label: '모집 완료' };
+    var v = Store.viewer();
+    if (!Store.state.session) return { code: 'login', msg: '로그인 후 신청할 수 있습니다.', label: '로그인 필요' };
+    if (!v) return { code: 'profile', msg: '블로그 크리에이터 계정으로 로그인해야 신청할 수 있습니다.', label: '크리에이터 계정 필요' };
+    var pct = c.gradeBenefit ? c.gradeBenefit[v.grade] : 0;
+    if (!(Number(pct) > 0)) {
+      return { code: 'grade', msg: Store.grade(v.grade).name + ' 등급은 이 캠페인에 참여할 수 없습니다. 등급별 혜택을 확인해 주세요.', label: '등급 미달' };
+    }
+    var dup = Store.myApplication(c.id);
+    if (dup) return { code: 'dup', msg: '이미 신청한 캠페인입니다. 내 활동에서 진행 상태를 확인하세요.', label: '신청 완료', app: dup };
+    return { code: 'ok', msg: '' };
+  },
+  disclosureText: function (c, a) {
+    if (c && c.disclosure) return c.disclosure.replace(/\{store\}/g, c.store || '').replace(/\{provide\}/g, c.provide || '');
+    var b = Store.brand(c && c.brand);
+    return '본 포스팅은 ' + b.name + ' ' + ((c && c.store) || '') + '에서 ' + ((c && c.provide) || '제공 내역') + '를 제공받아 작성한 솔직한 후기입니다.';
+  },
+  postDue: function (a) {
+    var c = Store.campaign(a.campaignId) || {};
+    var days = (c.mission && c.mission.postDays) || c.postDays || 7;
+    var base = U.parseISO(a.visitAt) || U.today();
+    return U.iso(U.addDays(base, days));
+  },
+  /* 선정된 블로거에게 보여 줄 가이드라인 한 묶음 */
+  guideline: function (a) {
+    var c = Store.campaign(a.campaignId) || {};
+    var st = Store.storeOf(c) || {};
+    var kw = c.keywords || { main: '', subs: [], tags: [] };
+    var due = Store.postDue(a);
+    return {
+      campaign: c, app: a, assigned: a.assignedKeyword || '',
+      postDays: (c.mission && c.mission.postDays) || c.postDays || 7, postDue: due, dday: U.dday(due),
+      address: c.address || st.address || '', area: c.area || st.area || '',
+      hours: c.hours || st.hours || { open: '', close: '' }, hoursNote: st.hoursNote || '',
+      blocked: c.blocked || [], notes: (c.notes || []).slice(),
+      provide: c.provide || '', points: c.points || 0,
+      keywords: { main: kw.main || '', assigned: a.assignedKeyword || '', subs: (kw.subs || []).slice(), tags: (kw.tags || []).slice() },
+      disclosure: Store.disclosureText(c, a),
+      checklist: {
+        items: ((c.mission && c.mission.items) || []).slice(),
+        minPhotos: (c.mission && c.mission.minPhotos) || 0,
+        minChars: (c.mission && c.mission.minChars) || 0,
+        receipt: !!(c.mission && c.mission.receipt)
+      },
+      mapUrl: 'https://map.naver.com/p/search/' + encodeURIComponent((c.store || '') + ' ' + (c.address || c.area || ''))
+    };
+  },
+  /* 검수 엔진에 넘길 캠페인 사본 — 개별 배정 키워드를 필수 키워드로 승격 */
+  campaignForReview: function (c, a) {
+    if (!c) return c;
+    var copy = JSON.parse(JSON.stringify(c));
+    var assigned = a && a.assignedKeyword ? String(a.assignedKeyword).trim() : '';
+    copy.keywords = copy.keywords || { main: '', subs: [], tags: [] };
+    copy.keywords.subs = copy.keywords.subs || [];
+    copy.keywords.tags = copy.keywords.tags || [];
+    if (assigned && copy.keywords.subs.indexOf(assigned) < 0) copy.keywords.subs = [assigned].concat(copy.keywords.subs);
+    return copy;
+  },
   benefitFor: function (c, gradeKey) {
     var gk = gradeKey || (Store.viewer() ? Store.viewer().grade : 'red');
     var pct = c.gradeBenefit ? c.gradeBenefit[gk] : 0;
@@ -2033,32 +2143,66 @@ var Store = {
       id: Store.nextId('AP'), campaignId: data.campaignId, creatorId: data.creatorId || (Store.state.session && Store.state.session.creatorId) || '',
       name: data.name || '', media: data.media, status: 'review', appliedAt: U.iso(U.today()),
       visitAt: data.visitAt || '', visitTime: data.visitTime || '', contact: data.contact || '',
-      url: data.url || '', blogType: data.blogType || '', note: data.note || '',
+      url: data.url || '', blogType: data.blogType || '', visitors: data.visitors || null,
+      companions: Number(data.companions || 1), requestNote: data.requestNote || '', assignedKeyword: '',
+      privacyAgreed: !!data.privacyAgreed, penaltyAgreed: !!data.penaltyAgreed, agreedAt: new Date().toISOString(),
       demo: !!(data.demo || !DB.configured()), createdAt: new Date().toISOString()
     };
     Store.state.applications.unshift(app);
     Store.save();
     if (DB.configured()) {
       DB.insert('applications', {
-        campaign_id: app.campaignId, creator_name: app.name || (Store.creator(app.creatorId) || {}).name || '',
-        contact: app.contact, blog_url: app.url, media: app.media, status: app.status,
-        visit_at: app.visitAt || null, visit_time: app.visitTime || null, note: app.note
+        campaign_id: app.campaignId, creator_id: app.creatorId,
+        creator_name: app.name || (Store.creator(app.creatorId) || {}).name || '',
+        contact: app.contact, blog_url: app.url, media: app.media, blog_type: app.blogType,
+        visitors: app.visitors, status: app.status, visit_at: app.visitAt || null, visit_time: app.visitTime || null,
+        companions: app.companions, request_note: app.requestNote, note: '',
+        privacy_agreed: app.privacyAgreed, penalty_agreed: app.penaltyAgreed, agreement_at: app.agreedAt
       }).then(function (row) { if (row && row.id) { app.remoteId = row.id; Store.save(); } });
     }
     return app;
   },
   setAppStatus: function (id, status, note) {
     var a = Store.app(id); if (!a) return null;
+    var before = a.status;
+    var counted = ['selected', 'visited', 'submitted', 'passed', 'fix'];
+    if (counted.indexOf(before) < 0 && counted.indexOf(status) >= 0) Store.bumpConfirmed(a.campaignId, 1);
+    if (counted.indexOf(before) >= 0 && ['rejected', 'noshow', 'review'].indexOf(status) >= 0) Store.bumpConfirmed(a.campaignId, -1);
     a.status = status;
     if (note != null) a.adminNote = note;
     Store.save();
-    if (DB.configured()) DB.update('applications', a.remoteId || a.id, { status: status, note: a.adminNote || '' });
+    if (DB.configured()) DB.update('applications', a.remoteId, { status: status, note: a.adminNote || '' });
+    return a;
+  },
+  /* 선정 시 확정 방문일시·개별 키워드 배정 */
+  setAppAssign: function (id, opts) {
+    var a = Store.app(id); if (!a) return null;
+    opts = opts || {};
+    var before = a.status;
+    var counted = ['selected', 'visited', 'submitted', 'passed', 'fix'];
+    if (opts.status && counted.indexOf(before) < 0 && counted.indexOf(opts.status) >= 0) Store.bumpConfirmed(a.campaignId, 1);
+    if (opts.visitAt) a.visitAt = opts.visitAt;
+    if (opts.visitTime != null) a.visitTime = opts.visitTime;
+    if (opts.assignedKeyword != null) a.assignedKeyword = String(opts.assignedKeyword || '').trim();
+    if (opts.status) a.status = opts.status;
+    if (opts.guideSentAt) a.guideSentAt = opts.guideSentAt;
+    Store.save();
+    if (DB.configured()) DB.update('applications', a.remoteId, {
+      status: a.status, visit_at: a.visitAt || null, visit_time: a.visitTime || null,
+      assigned_keyword: a.assignedKeyword || '', guide_sent_at: a.guideSentAt || null
+    });
     return a;
   },
   addReview: function (data) {
     var rv = {
       id: Store.nextId('RV'), appId: data.appId, campaignId: data.campaignId, creatorId: data.creatorId,
       media: data.media, url: data.url, title: data.title, body: data.body, checklist: data.checklist,
+      visitors: data.visitors != null ? data.visitors : null,
+      likes: data.likes != null ? data.likes : null,
+      comments: data.comments != null ? data.comments : null,
+      photos: (data.checklist && data.checklist.photos) || 0,
+      assignedKeyword: (Store.app(data.appId) || {}).assignedKeyword || '',
+      ranks: [], revision: 1,
       result: data.result, submittedAt: U.iso(U.today()),
       adminStatus: data.result && data.result.status === 'pass' ? 'passed' : 'submitted', adminNote: ''
     };
@@ -2068,12 +2212,39 @@ var Store = {
     Store.save();
     if (DB.configured()) {
       DB.insert('reviews', {
-        campaign_id: rv.campaignId, creator_name: (Store.creator(rv.creatorId) || {}).name || '',
+        application_id: app ? app.remoteId : '', campaign_id: rv.campaignId, creator_id: rv.creatorId,
+        creator_name: (Store.creator(rv.creatorId) || {}).name || '',
         media: rv.media, url: rv.url, title: rv.title, body: rv.body, score: rv.result ? rv.result.score : null,
-        status: rv.adminStatus
-      });
+        visitors: rv.visitors, likes: rv.likes, comments: rv.comments, photos: rv.photos,
+        checklist: rv.checklist || null, assigned_keyword: rv.assignedKeyword || '', ranks: [],
+        revision: 1, status: rv.adminStatus, submitted_at: new Date().toISOString()
+      }).then(function (row) { if (row && row.id) { rv.remoteId = row.id; Store.save(); } });
     }
     return rv;
+  },
+  /* 수정요청 받은 포스팅 재제출 — 같은 리뷰 레코드를 갱신하고 재검수한다. */
+  resubmitReview: function (id, data) {
+    var r = Store.state.reviews.filter(function (x) { return x.id === id; })[0];
+    if (!r) return null;
+    r.url = data.url; r.title = data.title; r.body = data.body; r.checklist = data.checklist;
+    r.visitors = data.visitors != null ? data.visitors : r.visitors;
+    r.likes = data.likes != null ? data.likes : r.likes;
+    r.comments = data.comments != null ? data.comments : r.comments;
+    r.photos = (data.checklist && data.checklist.photos) || r.photos;
+    r.result = data.result;
+    r.adminStatus = data.result && data.result.status === 'pass' ? 'passed' : 'submitted';
+    r.adminNote = '';
+    r.revision = (r.revision || 1) + 1;
+    r.submittedAt = U.iso(U.today());
+    var app = Store.app(r.appId);
+    if (app) app.status = r.adminStatus === 'passed' ? 'passed' : 'submitted';
+    Store.save();
+    if (DB.configured()) DB.update('reviews', r.remoteId, {
+      url: r.url, title: r.title, body: r.body, checklist: r.checklist || null, score: r.result ? r.result.score : null,
+      visitors: r.visitors, likes: r.likes, comments: r.comments, photos: r.photos,
+      revision: r.revision, status: r.adminStatus, note: ''
+    });
+    return r;
   },
   setReviewStatus: function (id, status, note) {
     var r = Store.state.reviews.filter(function (x) { return x.id === id; })[0];
@@ -2081,9 +2252,29 @@ var Store = {
     r.adminStatus = status;
     if (note != null) r.adminNote = note;
     var app = Store.app(r.appId);
-    if (app) app.status = status === 'passed' ? 'passed' : (status === 'fix' ? 'fix' : 'submitted');
+    if (app) {
+      app.status = status === 'passed' ? 'passed' : (status === 'fix' ? 'fix' : 'submitted');
+      if (status === 'fix') app.fixNote = r.adminNote || '';
+      else if (status === 'passed') app.fixNote = '';
+    }
     Store.save();
-    if (DB.configured()) DB.update('reviews', r.remoteId || r.id, { status: status, note: r.adminNote || '' });
+    if (DB.configured()) DB.update('reviews', r.remoteId, { status: status, note: r.adminNote || '' });
+    return r;
+  },
+  /* 관리자가 입력하는 포스팅 인사이트(일방문자·공감·댓글·사진·키워드 순위) */
+  setReviewInsight: function (id, patch) {
+    var r = Store.state.reviews.filter(function (x) { return x.id === id; })[0];
+    if (!r) return null;
+    ['visitors', 'likes', 'comments', 'photos'].forEach(function (k) {
+      if (patch[k] !== undefined) r[k] = patch[k] == null || patch[k] === '' ? null : Number(patch[k]);
+    });
+    if (patch.ranks) r.ranks = patch.ranks;
+    r.insightAt = U.iso(U.today());
+    Store.save();
+    if (DB.configured()) DB.update('reviews', r.remoteId, {
+      visitors: r.visitors, likes: r.likes, comments: r.comments, photos: r.photos,
+      ranks: r.ranks || [], insight_at: new Date().toISOString()
+    });
     return r;
   },
   addManner: function (data) {
@@ -2788,6 +2979,8 @@ var ViewExplore = {
     var b = Store.brand(c.brand);
     var cap = Store.capacityOf(c);
     var closed = Store.isClosed(c);
+    var blk = Store.applyBlock(c);
+    var myApp = blk.app || Store.myApplication(c.id);
     var myGrade = Store.viewer() ? Store.viewer().grade : null;
     var ben = myGrade ? Store.benefitFor(c, myGrade) : null;
     var dl = c.status === 'ended' ? { label: '종료', cls: 'off' } : U.dday(Store.deadline(c));
@@ -2806,7 +2999,7 @@ var ViewExplore = {
           '<span>' + (c.status === 'ended' ? '종료' : (c.visitType === 'free' ? '자유방문형' : '예약선정형')) + '</span>' +
           '<span>' + U.esc(c.region) + '</span>' +
           '<span>' + dl.label + '</span>' +
-          (ben ? '<span style="background:var(--coral);color:#fff">' + ben.label + '</span>' : '') +
+          (ben ? '<span style="background:var(--coral);color:#fff">' + (ben.pct > 0 ? ben.label : '내 등급 참여 불가') + '</span>' : '') +
         '</div></div>' +
       '<div class="m-pad">' +
         '<div class="d-brand"><span class="gb" style="background:' + b.accent + '">' + U.esc(b.name) + '</span>' +
@@ -2834,6 +3027,14 @@ var ViewExplore = {
           c.blocked.map(function (x) { return x.label + ' ' + x.from + '~' + x.to; }).join(' · ') + '</div></div>' : '') +
         '<div class="d-sec"><h3>' + icon('crown') + '등급별 혜택</h3><div class="grade-table">' + gradeRows + '</div></div>' +
         '<div class="d-sec"><h3>' + icon('info') + '안내</h3><div class="notice">' + c.notes.map(function (n) { return '· ' + U.esc(n); }).join('<br>') + '</div></div>' +
+        (myApp
+          ? '<div class="notice" style="margin-top:12px;background:var(--mint-50,#EAFBF4);color:#0A6449">' + icon('check') +
+            ' <span style="margin-left:5px">이미 신청한 캠페인입니다 · ' + U.esc((STATUS_META[myApp.status] || STATUS_META.review).label) +
+            (myApp.assignedKeyword ? ' · 배정 키워드 ‘' + U.esc(myApp.assignedKeyword) + '’' : '') + '</span></div>'
+          : '') +
+        (blk.code !== 'ok' && blk.code !== 'dup' && blk.code !== 'login'
+          ? '<div class="notice warn" style="margin-top:12px">' + icon('lock') + ' <span style="margin-left:5px">' + U.esc(blk.msg) + '</span></div>'
+          : '') +
         (c.exposure ? '<div class="d-sec"><h3>' + icon('chart') + '이 매장의 검색 현황</h3>' +
           '<div class="kpis" style="grid-template-columns:repeat(3,1fr)">' +
             '<div class="kpi" style="box-shadow:none"><div class="k-lab">플레이스 순위</div><b>' + c.exposure.rank + '위</b><div class="k-sub">‘' + U.esc(c.exposure.keyword) + '’</div></div>' +
@@ -2845,22 +3046,36 @@ var ViewExplore = {
         '<button class="btn btn-ghost" type="button" data-act="closeModal">닫기</button>' +
         (c.status === 'ended'
           ? '<button class="btn btn-ghost" type="button" data-act="reportGo" data-id="' + c.id + '">' + icon('doc') + '11월 성과 보고서 보기</button>'
-          : (closed
-            ? '<button class="btn btn-ghost" type="button" disabled>' + icon('lock') + '모집 마감</button>'
-            : '<button class="btn btn-primary" type="button" data-act="goApply" data-id="' + c.id + '">' + icon('send') + '원클릭 신청' + (ben ? ' · ' + ben.label : '') + '</button>')) +
+          : (blk.code === 'ok'
+            ? '<button class="btn btn-primary" type="button" data-act="goApply" data-id="' + c.id + '">' + icon('send') + '원클릭 신청' + (ben ? ' · ' + ben.label : '') + '</button>'
+            : (blk.code === 'dup'
+              ? '<button class="btn btn-primary" type="button" data-act="goMy">' + icon('user') + '신청 완료 · 내 활동에서 확인</button>'
+              : (blk.code === 'login'
+                ? '<button class="btn btn-primary" type="button" data-act="goApply" data-id="' + c.id + '">' + icon('lock') + '로그인 후 신청</button>'
+                : '<button class="btn btn-ghost" type="button" disabled>' + icon('lock') + blk.label + '</button>')))) +
       '</div>';
   },
 
   /* ------------------------------------------------------------- 신청 모달 -- */
   apply: function (c, media) {
     var v = Store.viewer();
-    var myGrade = v ? Store.grade(v.grade) : null;
-    var ben = myGrade ? Store.benefitFor(c, myGrade) : null;
+    var ben = v ? Store.benefitFor(c, v.grade) : null;
     var times = ViewExplore.timeOptions(c);
+    var range = Store.visitRange(c);
+    var minDate = range && range.min > U.iso(U.today()) ? range.min : U.iso(U.today());
+    var maxAttr = range ? ' max="' + range.max + '"' : '';
+    var cap = Store.capacityOf(c);
     return '<div class="m-pad">' +
       '<div class="m-head"><span class="eyebrow">' + icon('send') + 'APPLY</span>' +
         '<h2 style="margin-top:8px">' + U.esc(c.campaignName) + '</h2>' +
-        '<p class="sub">' + U.esc(c.store) + ' · ' + U.esc(c.provide) + (ben ? ' · <b style="color:var(--coral-2)">' + ben.label + '</b>' : '') + '</p></div>' +
+        '<p class="sub">' + U.esc(c.store) + ' · ' + U.esc(c.provide) + (ben ? ' · <b style="color:var(--coral-2)">' + (ben.pct > 0 ? ben.label : '내 등급 참여 불가') + '</b>' : '') + '</p></div>' +
+      '<div class="receipt" style="margin:0 0 14px">' +
+        '<div><span>모집 현황</span><span>' + cap.confirmed + ' / ' + cap.capacity + '명 · ' + U.dday(Store.deadline(c)).label + '</span></div>' +
+        '<div><span>방문 가능 기간</span><span>' + U.esc(c.visitWindow || '선정 후 협의') + '</span></div>' +
+        '<div><span>필수 키워드</span><span style="max-width:62%;word-break:keep-all">' + U.esc(c.keywords.main) +
+          ((c.keywords.subs || []).length ? ' · ' + U.esc(c.keywords.subs.join(', ')) : '') + '</span></div>' +
+        '<div><span>제공 내역</span><span>' + U.esc(c.provide) + '</span></div>' +
+      '</div>' +
       '<form id="applyForm" novalidate>' +
         '<div class="form-grid">' +
           '<div class="field"><label for="aName">활동명 <span class="req">*</span></label>' +
@@ -2869,7 +3084,7 @@ var ViewExplore = {
             '<input class="input" id="aContact" placeholder="카톡 아이디 또는 휴대폰" autocomplete="tel"><span class="err" id="eContact"></span></div>' +
           '<div class="field full"><label for="aUrl">채널 주소 <span class="req">*</span></label>' +
             '<input class="input" id="aUrl" value="' + U.esc(v && v.blogUrl ? v.blogUrl : '') + '" placeholder="' + MEDIA[media].urlHint + '" inputmode="url">' +
-            '<span class="hint">' + MEDIA[media].urlHint + '</span><span class="err" id="eUrl"></span></div>' +
+            '<span class="hint">' + MEDIA[media].urlHint + (v && v.blogUrl ? ' · 프로필 주소를 불러왔습니다' : ' · 미등록이면 주소를 직접 입력해 주세요') + '</span><span class="err" id="eUrl"></span></div>' +
           '<div class="field full"><label>신청 매체</label><div class="radio-row">' +
             (c.media || []).map(function (m) {
               return '<label><input type="radio" name="applyMedia" value="' + m + '"' + (m === media ? ' checked' : '') + '>' + MEDIA[m].short + '</label>';
@@ -2878,19 +3093,28 @@ var ViewExplore = {
             ['준', '최적화', '인플'].map(function (t) {
               return '<label><input type="radio" name="blogType" value="' + t + '"' + (t === '최적화' ? ' checked' : '') + '>' + t + '</label>';
             }).join('') + '</div></div>' +
-          '<div class="field"><label for="aVisitors">일 방문자 수</label><input class="input" id="aVisitors" type="number" min="0" inputmode="numeric" placeholder="예: 350"></div>' : '') +
+          '<div class="field"><label for="aVisitors">일 방문자 수</label><input class="input" id="aVisitors" type="number" min="0" inputmode="numeric" placeholder="예: 350"' + (v && v.visitors != null ? ' value="' + v.visitors + '"' : '') + '></div>' : '') +
           '<div class="field"><label for="aVisitDate">방문 희망일 <span class="req">*</span></label>' +
-            '<input class="input" id="aVisitDate" type="date" min="' + U.iso(U.today()) + '"><span class="err" id="eVisit"></span></div>' +
+            '<input class="input" id="aVisitDate" type="date" min="' + minDate + '"' + maxAttr + '><span class="hint">' + (range ? range.min + ' ~ ' + range.max + ' 내' : '선정 후 협의 가능') + '</span><span class="err" id="eVisit"></span></div>' +
           (c.visitType === 'free'
             ? '<div class="field"><label>방문 방식</label><div class="notice" style="padding:10px 12px">기간 내 원하는 날 방문 · 시간 제한 없음</div></div>'
-            : '<div class="field"><label for="aVisitTime">방문 시간 <span class="req">*</span></label>' +
+            : '<div class="field"><label for="aVisitTime">방문 희망 시간 <span class="req">*</span></label>' +
               '<select class="input" id="aVisitTime">' + times + '</select><span class="err" id="eTime"></span></div>') +
+          '<div class="field"><label for="aCompanions">동반 인원 <span class="req">*</span></label><select class="input" id="aCompanions">' +
+            [1, 2, 3, 4].map(function (n) { return '<option value="' + n + '"' + (n === 1 ? ' selected' : '') + '>' + (n === 1 ? '본인만 (1명)' : n + '명 (동반 ' + (n - 1) + '명)') + '</option>'; }).join('') +
+          '</select><span class="hint">제공 내역은 신청 인원 기준입니다.</span></div>' +
+          '<div class="field full"><label for="aNote">신청 한마디 <span class="tiny" style="font-weight:700">(선택)</span></label>' +
+            '<textarea id="aNote" rows="2" maxlength="200" placeholder="선정에 참고할 내용을 짧게 적어 주세요. (예: 교동·동성로 술집 리뷰를 꾸준히 쓰고 있습니다 / 11월 19시 이후 방문 가능)"></textarea>' +
+            '<span class="hint">매장·담당자만 확인합니다. 최대 200자.</span></div>' +
         '</div>' +
         (c.blocked && c.blocked.length ? '<div class="notice warn" style="margin-top:12px">' + icon('alert') +
           '<span style="margin-left:5px">제외 시간: ' + c.blocked.map(function (x) { return x.label + ' ' + x.from + '~' + x.to; }).join(' · ') + '</span></div>' : '') +
         '<label class="consent" style="margin-top:14px"><input type="checkbox" id="aConsent">' +
-          '<span>개인정보 수집·이용에 동의합니다. (활동명·연락처·채널 주소는 캠페인 선정과 안내 목적으로만 사용하며, 종료 후 6개월 뒤 파기합니다.)</span></label>' +
+          '<span>개인정보 수집·이용에 동의합니다. (활동명·연락처·채널 주소는 캠페인 선정과 안내 목적으로만 사용하며, 종료 후 6개월 뒤 파기합니다.) <b>[필수]</b></span></label>' +
         '<span class="err" id="eConsent"></span>' +
+        '<label class="consent"><input type="checkbox" id="aPenalty">' +
+          '<span>노쇼·패널티 규정에 동의합니다. (방문 24시간 전까지 변경·취소 가능 · 사전 연락 없는 노쇼 1회당 매너 0.5점 차감, 3회 누적 시 3개월 신청 정지) <b>[필수]</b></span></label>' +
+        '<span class="err" id="ePenalty"></span>' +
         '<div class="form-error" id="formError">' + icon('alert') + '<span id="formErrorText"></span></div>' +
         '<div class="form-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">' +
           '<button class="btn btn-ghost" type="button" data-act="backToDetail" data-id="' + c.id + '">이전</button>' +
@@ -2926,8 +3150,9 @@ var ViewExplore = {
         '<div><span>접수번호</span><span>' + U.esc(app.id) + '</span></div>' +
         '<div><span>캠페인</span><span>' + U.esc(c.store) + ' · ' + U.esc(c.campaignName) + '</span></div>' +
         '<div><span>매체</span><span>' + U.esc(MEDIA[app.media] ? MEDIA[app.media].name : app.media) + '</span></div>' +
-        '<div><span>방문 희망</span><span>' + (app.visitAt ? U.fmtMD(app.visitAt) + ' ' + (app.visitTime || '') : '자유방문') + '</span></div>' +
+        '<div><span>방문 희망</span><span>' + (app.visitAt ? U.fmtMD(app.visitAt) + ' ' + (app.visitTime || '') : '자유방문') + ' · ' + (app.companions || 1) + '명</span></div>' +
         '<div><span>저장 위치</span><span>' + (DB.configured() ? 'Supabase DB' : '데모 저장(브라우저)') + '</span></div>' +
+        '<div><span>다음 단계</span><span>선정 시 확정 일시·키워드 가이드가 내 활동에 표시됩니다</span></div>' +
       '</div>' +
       '<div style="display:flex;gap:8px;justify-content:center;margin-top:18px">' +
         '<button class="btn btn-ghost" type="button" data-act="closeModal">캠페인 더 보기</button>' +
@@ -3172,6 +3397,8 @@ var ViewMy = {
     var b = Store.brand(c.brand);
     var st = STATUS_META[a.status] || STATUS_META.review;
     var rv = Store.reviewOf(a.id);
+    var fixNote = a.status === 'fix' ? ((rv && rv.adminNote) || a.fixNote || '') : '';
+    var hasGuide = ['selected', 'visited', 'submitted', 'fix', 'passed'].indexOf(a.status) >= 0;
     return '<div class="app-card">' +
       '<div class="ac-top"><div style="min-width:0">' +
         '<div class="cc-brand">' + U.esc(b.name) + '<i></i>' + U.esc(c.region || '') + '</div>' +
@@ -3180,20 +3407,98 @@ var ViewMy = {
       '<div class="ac-meta">' +
         '<span class="mchip">' + mediaIcon(a.media) + (MEDIA[a.media] || {}).short + '</span>' +
         '<span class="mchip">' + icon('calendar') + (a.visitAt ? U.fmtMD(a.visitAt) + ' ' + (a.visitTime || '') : '자유방문') + '</span>' +
-        '<span class="mchip">' + icon('user') + U.esc(a.name || '') + '</span>' +
+        '<span class="mchip">' + icon('user') + (a.companions ? a.companions + '명' : U.esc(a.name || '')) + '</span>' +
+        (a.assignedKeyword ? '<span class="mchip" style="background:var(--coral-50);color:var(--coral-2)">' + icon('target') + U.esc(a.assignedKeyword) + '</span>' : '') +
       '</div>' +
       ViewMy.stepper(a.status) +
-      (a.status === 'fix' && a.adminNote ? '<div class="notice warn" style="font-size:11.5px">' + icon('alert') + ' <span style="margin-left:4px">' + U.esc(a.adminNote) + '</span></div>' : '') +
+      (fixNote ? '<div class="notice warn" style="font-size:11.5px;white-space:pre-line">' + icon('alert') + ' <span style="margin-left:4px">' + U.esc(fixNote) + '</span></div>' : '') +
       '<div class="ac-foot"><span class="tiny">접수 ' + U.fmtFull(a.appliedAt) + (a.demo ? ' · 데모' : '') + '</span>' +
-        '<span style="display:flex;gap:5px">' +
+        '<span style="display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end">' +
+          (hasGuide ? '<button class="btn btn-ghost btn-sm" type="button" data-act="openGuideline" data-id="' + a.id + '">' + icon('book') + '가이드라인</button>' : '') +
           (['selected', 'visited', 'fix', 'submitted'].indexOf(a.status) >= 0
-            ? '<button class="btn btn-soft btn-sm" type="button" data-act="startReview" data-id="' + a.id + '">' + icon(rv ? 'eye' : 'edit') + (rv ? '검수 결과' : '리뷰 제출') + '</button>'
+            ? '<button class="btn btn-soft btn-sm" type="button" data-act="startReview" data-id="' + a.id + '">' + icon(a.status === 'fix' ? 'edit' : (rv ? 'eye' : 'send')) + (a.status === 'fix' ? '수정 후 재제출' : (rv ? '제출 내용' : '리뷰 제출')) + '</button>'
             : '') +
+          (a.status === 'passed' && rv ? '<button class="btn btn-soft btn-sm" type="button" data-act="viewResult" data-id="' + a.id + '">' + icon('eye') + '검수 결과</button>' : '') +
           (a.status === 'review' ? '<button class="btn btn-ghost btn-sm" type="button" data-act="cancelApp" data-id="' + a.id + '">신청 취소</button>' : '') +
           (a.status === 'selected' ? '<button class="btn btn-ghost btn-sm" type="button" data-act="changeVisit" data-id="' + a.id + '">일정 변경</button>' : '') +
         '</span></div></div>';
   },
 
+  /* ---------------------------------------------- 선정자 가이드라인 모달 -- */
+  guideline: function (a) {
+    var g = Store.guideline(a);
+    var c = g.campaign;
+    var b = Store.brand(c.brand);
+    var ddayCls = g.dday && g.dday.n <= 1 ? 'soon' : '';
+    var copyBtn = function (target, label) {
+      return '<button class="btn btn-ghost btn-sm" type="button" data-act="copyField" data-target="' + target + '" data-msg="' + label + '를 복사했습니다.">' + icon('copy') + '복사</button>';
+    };
+    var fullText = [
+      '[' + b.name + '] ' + c.store + ' · ' + c.campaignName + ' 가이드라인',
+      '· 확정 방문일시: ' + (a.visitAt ? U.fmtFull(a.visitAt) + ' ' + (a.visitTime || '') : '자유방문') + ' / ' + (a.companions || 1) + '명',
+      '· 주소: ' + (g.address || g.area),
+      '· 영업시간: ' + (g.hours.open || '') + '~' + (g.hours.close || ''),
+      '· 제공 내역: ' + g.provide,
+      '· 필수 키워드: ' + g.keywords.main + (g.keywords.assigned ? ' / 배정: ' + g.keywords.assigned : ''),
+      '· 해시태그: ' + g.keywords.tags.join(' '),
+      '· 대가성 문구: ' + g.disclosure,
+      '· 작성 기준: 사진 ' + g.checklist.minPhotos + '장 이상, 본문 ' + g.checklist.minChars + '자 이상' + (g.checklist.receipt ? ', 영수증 인증' : ''),
+      '· 포스팅 마감: ' + (a.visitAt ? g.postDue + ' (' + g.postDays + '일 이내)' : '방문 후 ' + g.postDays + '일 이내')
+    ].join('\n');
+    var hidden = '<textarea id="gwKwMain" style="display:none">' + U.esc(g.keywords.main) + '</textarea>' +
+      '<textarea id="gwKwAssigned" style="display:none">' + U.esc(g.keywords.assigned) + '</textarea>' +
+      '<textarea id="gwKwSubs" style="display:none">' + U.esc(g.keywords.subs.join(', ')) + '</textarea>' +
+      '<textarea id="gwKwAll" style="display:none">' + U.esc([g.keywords.main].concat(g.keywords.assigned ? [g.keywords.assigned] : []).concat(g.keywords.subs).join(', ')) + '</textarea>' +
+      '<textarea id="gwTags" style="display:none">' + U.esc(g.keywords.tags.join(' ')) + '</textarea>' +
+      '<textarea id="gwDisclosure" style="display:none">' + U.esc(g.disclosure) + '</textarea>' +
+      '<textarea id="gwAddress" style="display:none">' + U.esc((g.address || '') + ' ' + (c.store || '')) + '</textarea>' +
+      '<textarea id="gwFull" style="display:none">' + U.esc(fullText) + '</textarea>';
+    return '<div class="m-pad">' + hidden +
+      '<div class="m-head"><span class="eyebrow mint">' + icon('book') + 'GUIDE</span>' +
+        '<h2 style="margin-top:8px">' + U.esc(c.campaignName) + '</h2>' +
+        '<p class="sub">' + U.esc(b.name) + ' · ' + U.esc(c.store) + ' · <span class="gb ' + (STATUS_META[a.status] || {}).cls + '">' + U.esc((STATUS_META[a.status] || {}).label || '') + '</span></p></div>' +
+      '<div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:12px">' +
+        '<div class="kpi" style="box-shadow:none"><div class="k-lab">' + icon('calendar') + '확정 방문일시</div><b style="font-size:14px">' +
+          (a.visitAt ? U.fmtMD(a.visitAt) + ' ' + U.esc(a.visitTime || '') : '자유방문 · 미확정') + '</b><div class="k-sub">' + (a.companions || 1) + '명 기준</div></div>' +
+        '<div class="kpi" style="box-shadow:none"><div class="k-lab">' + icon('clock') + '포스팅 마감</div><b style="font-size:14px">' +
+          (a.visitAt ? U.fmtMD(g.postDue) + ' <span class="cc-dday ' + ddayCls + '" style="position:static;display:inline-block;margin-left:3px">' + g.dday.label + '</span>' : '방문 후 ' + g.postDays + '일') +
+          '</b><div class="k-sub">' + (a.visitAt ? '방문 ' + g.postDays + '일 이내' : '방문일 확정 후 계산') + '</div></div>' +
+        '<div class="kpi" style="box-shadow:none"><div class="k-lab">' + icon('gift') + '제공 내역</div><b style="font-size:13px;line-height:1.35">' + U.esc(g.provide) + '</b><div class="k-sub">완료 시 ' + U.fmtNum(g.points) + 'P</div></div>' +
+      '</div>' +
+      '<div class="settings-sec"><h3>' + icon('pin') + '매장 정보</h3>' +
+        '<div class="receipt" style="margin:0">' +
+          '<div><span>주소</span><span style="max-width:66%">' + U.esc(g.address || g.area || '-') + '</span></div>' +
+          '<div><span>영업시간</span><span>' + U.esc(g.hours.open || '') + ' ~ ' + U.esc(g.hours.close || '') + (g.hoursNote ? ' · ' + U.esc(g.hoursNote) : '') + '</span></div>' +
+          (g.blocked.length ? '<div><span>방문 제외 시간</span><span style="max-width:66%">' + g.blocked.map(function (x) { return U.esc(x.label) + ' ' + U.esc(x.from) + '~' + U.esc(x.to); }).join(' · ') + '</span></div>' : '') +
+        '</div>' +
+        '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">' + copyBtn('gwAddress', '주소') +
+          '<button class="btn btn-ghost btn-sm" type="button" data-act="openUrl" data-url="' + U.esc(g.mapUrl) + '">' + icon('external') + '네이버 지도</button></div></div>' +
+      '<div class="settings-sec"><h3>' + icon('target') + '필수 키워드</h3>' +
+        '<div class="map-table">' +
+          '<div><b>메인 키워드</b><span style="display:flex;gap:6px;align-items:center;justify-content:flex-end">' + U.esc(g.keywords.main) + copyBtn('gwKwMain', '메인 키워드') + '</span></div>' +
+          (g.keywords.assigned ? '<div><b>개별 배정</b><span style="display:flex;gap:6px;align-items:center;justify-content:flex-end;color:var(--coral-2);font-weight:900">' + U.esc(g.keywords.assigned) + copyBtn('gwKwAssigned', '배정 키워드') + '</span></div>' : '<div><b>개별 배정</b><span class="tiny">메인 키워드 사용 (배정 없음)</span></div>') +
+          '<div><b>서브 키워드</b><span style="display:flex;gap:6px;align-items:center;justify-content:flex-end;text-align:right">' + U.esc(g.keywords.subs.join(', ')) + copyBtn('gwKwSubs', '서브 키워드') + '</span></div>' +
+          '<div><b>해시태그</b><span style="display:flex;gap:6px;align-items:center;justify-content:flex-end;text-align:right">' + U.esc(g.keywords.tags.join(' ')) + copyBtn('gwTags', '해시태그') + '</span></div>' +
+        '</div>' +
+        '<button class="btn btn-soft btn-sm" style="margin-top:7px" type="button" data-act="copyField" data-target="gwKwAll" data-msg="키워드 전체를 복사했습니다.">' + icon('copy') + '키워드 전체 복사</button></div>' +
+      '<div class="settings-sec"><h3>' + icon('shield') + '공정위 대가성 문구</h3>' +
+        '<textarea id="gwDisclosureView" rows="2" readonly style="font-size:12px;background:var(--surface)">' + U.esc(g.disclosure) + '</textarea>' +
+        '<button class="btn btn-ghost btn-sm" style="margin-top:7px" type="button" data-act="copyField" data-target="gwDisclosure" data-msg="대가성 문구를 복사했습니다.">' + icon('copy') + '문구 복사</button>' +
+        '<p class="tiny" style="margin-top:5px">본문 하단에 그대로 넣으면 검수에서 대가성 문구 항목이 통과됩니다.</p></div>' +
+      '<div class="settings-sec"><h3>' + icon('checklist') + '필수 촬영·작성 체크리스트</h3><div class="check-list">' +
+        g.checklist.items.map(function (it) { return '<div>' + icon('check') + '<span>' + U.esc(it) + '</span></div>'; }).join('') +
+        '<div>' + icon('check') + '<span>사진 ' + g.checklist.minPhotos + '장 이상 · 본문 ' + U.fmtNum(g.checklist.minChars) + '자 이상</span></div>' +
+        (g.checklist.receipt ? '<div>' + icon('check') + '<span>영수증 인증 1장</span></div>' : '') +
+        '<div>' + icon('check') + '<span>필수 해시태그 ' + g.keywords.tags.length + '개 포함</span></div></div></div>' +
+      (g.notes.length ? '<div class="settings-sec"><h3>' + icon('alert') + '방문 주의사항</h3><div class="notice warn">' + g.notes.map(function (n) { return '· ' + U.esc(n); }).join('<br>') + '</div></div>' : '') +
+      '<div class="notice" style="margin-top:10px;font-size:11.5px">' + icon('info') + ' <span style="margin-left:4px">가이드 전체를 복사해 메모장에 두고 촬영·작성할 때 확인하세요.</span></div>' +
+      '<div class="m-foot" style="padding:14px 0 0;border:0">' +
+        '<button class="btn btn-ghost" type="button" data-act="closeModal">닫기</button>' +
+        '<button class="btn btn-ghost" type="button" data-act="copyField" data-target="gwFull" data-msg="가이드라인 전체를 복사했습니다.">' + icon('copy') + '가이드 전체 복사</button>' +
+        (a.status === 'selected' ? '<button class="btn btn-ghost" type="button" data-act="changeVisit" data-id="' + a.id + '">일정 변경</button>' : '') +
+        (['selected', 'visited', 'fix', 'submitted'].indexOf(a.status) >= 0 ? '<button class="btn btn-primary" type="button" data-act="startReview" data-id="' + a.id + '">' + icon('send') + (a.status === 'fix' ? '수정 후 재제출' : '리뷰 제출') + '</button>' : '') +
+      '</div></div>';
+  },
   gate: function () {
     return '<div class="panel" style="padding:clamp(22px,4vw,40px);text-align:center">' +
       '<img src="' + iconSrc('profile') + '" alt="" style="width:86px;margin:0 auto 14px">' +
@@ -3260,7 +3565,8 @@ var ViewMy = {
     }
     if (!App.reviewAppId || !list.some(function (a) { return a.id === App.reviewAppId; })) App.reviewAppId = list[0].id;
     var app = Store.app(App.reviewAppId);
-    var c = Store.campaign(app.campaignId);
+    var c = Store.campaignForReview(Store.campaign(app.campaignId), app);
+    var prevRv = Store.reviewOf(app.id);
     if (!App.reviewDraft || App.reviewDraft.appId !== app.id) App.reviewDraft = ViewMy.blankDraft(app, c);
     var d = App.reviewDraft;
     var res = Inspector.run(d, c);
@@ -3270,10 +3576,19 @@ var ViewMy = {
         U.esc((cc.store || '') + ' · ' + (STATUS_META[a.status] || {}).label) + '</button>';
     }).join('') + '</div>';
 
-    var body = '<div class="panel"><div class="panel-head"><h3>' + icon('edit') + '포스팅 제출</h3>' +
-      '<span style="display:flex;gap:5px"><button class="btn btn-ghost btn-sm" type="button" data-act="loadSample" data-kind="good">통과 예시</button>' +
+    var fixBanner = '';
+    if (app.status === 'fix') {
+      var reason = (prevRv && prevRv.adminNote) || app.fixNote || '';
+      fixBanner = '<div class="notice warn" style="margin-bottom:12px;white-space:pre-line">' + icon('alert') +
+        '<span style="margin-left:5px"><b>수정 요청 사유</b>' + (reason ? '<br>' + U.esc(reason) : ' · 담당자 메모가 없습니다. 아래 자동 검수 항목을 확인해 주세요.') +
+        '<br><span class="tiny">수정 후 다시 제출하면 같은 포스팅으로 재검수됩니다.' + (prevRv && prevRv.revision ? ' (재제출 ' + prevRv.revision + '회차)' : '') + '</span></span></div>';
+    }
+
+    var body = '<div class="panel"><div class="panel-head"><h3>' + icon('edit') + (app.status === 'fix' ? '수정 후 재제출' : '포스팅 제출') + '</h3>' +
+      '<span style="display:flex;gap:5px"><button class="btn btn-ghost btn-sm" type="button" data-act="openGuideline" data-id="' + app.id + '">' + icon('book') + '가이드라인</button>' +
+      '<button class="btn btn-ghost btn-sm" type="button" data-act="loadSample" data-kind="good">통과 예시</button>' +
       '<button class="btn btn-ghost btn-sm" type="button" data-act="loadSample" data-kind="bad">미흡 예시</button></span></div>' +
-      '<div class="panel-body">' + pick +
+      '<div class="panel-body">' + pick + fixBanner +
         '<div class="form-grid">' +
           '<div class="field full"><label for="rUrl">포스팅 링크 <span class="req">*</span></label>' +
             '<input class="input" id="rUrl" data-draft="url" value="' + U.esc(d.url) + '" placeholder="' + MEDIA[app.media].urlHint + '" inputmode="url">' +
@@ -3289,8 +3604,14 @@ var ViewMy = {
               return '<label style="height:34px;padding:0 10px"><input type="checkbox" data-draft="' + x[0] + '"' + (d.checklist[x[0]] ? ' checked' : '') + '>' + x[1] + '</label>';
             }).join('') + '</div></div>' +
         '</div>' +
+        '<div class="settings-sec"><h3>' + icon('chart') + '발행 후 인사이트 <span class="tiny" style="font-weight:700">(선택 · 관리자 보고서에 반영)</span></h3>' +
+          '<div class="form-grid" style="grid-template-columns:repeat(3,1fr)">' +
+            '<div class="field"><label for="rVisitors">일방문자</label><input class="input" id="rVisitors" type="number" min="0" inputmode="numeric" data-draft="visitors" value="' + (d.visitors != null ? d.visitors : '') + '" placeholder="예: 210"></div>' +
+            '<div class="field"><label for="rLikes">공감 수</label><input class="input" id="rLikes" type="number" min="0" inputmode="numeric" data-draft="likes" value="' + (d.likes != null ? d.likes : '') + '" placeholder="예: 18"></div>' +
+            '<div class="field"><label for="rComments">댓글 수</label><input class="input" id="rComments" type="number" min="0" inputmode="numeric" data-draft="comments" value="' + (d.comments != null ? d.comments : '') + '" placeholder="예: 6"></div>' +
+          '</div><span class="hint">발행 3~7일 뒤 확인한 수치를 적어 주세요. 비워 두면 관리자가 검수하면서 채웁니다.</span></div>' +
         '<div class="form-actions" style="display:flex;justify-content:flex-end;margin-top:14px">' +
-          '<button class="btn btn-primary" type="button" data-act="submitReview" data-id="' + app.id + '">' + icon('send') + '검수 후 제출</button></div>' +
+          '<button class="btn btn-primary" type="button" data-act="submitReview" data-id="' + app.id + '">' + icon('send') + (app.status === 'fix' ? '수정 후 재제출' : '검수 후 제출') + '</button></div>' +
       '</div></div>';
 
     var side = '<div class="panel sticky-side"><div class="panel-head"><h3>' + icon('checklist') + '자동 검수 결과</h3>' +
@@ -3301,8 +3622,19 @@ var ViewMy = {
   },
 
   blankDraft: function (app, c) {
-    return { appId: app.id, media: app.media, url: '', title: '', body: '',
+    var draft = { appId: app.id, media: app.media, url: '', title: '', body: '', visitors: '', likes: '', comments: '',
       checklist: { photos: 0, receipt: false, visitProof: false, hashtags: false, disclosure: false } };
+    var rv = Store.reviewOf(app.id);
+    if (rv && rv.adminStatus !== 'passed' && rv.body) {
+      draft.url = rv.url || '';
+      draft.title = rv.title || '';
+      draft.body = rv.body || '';
+      draft.visitors = rv.visitors != null ? rv.visitors : '';
+      draft.likes = rv.likes != null ? rv.likes : '';
+      draft.comments = rv.comments != null ? rv.comments : '';
+      if (rv.checklist) draft.checklist = JSON.parse(JSON.stringify(rv.checklist));
+    }
+    return draft;
   },
 
   inspector: function (res, c, app) {
@@ -3362,13 +3694,14 @@ var ViewMy = {
     var recorded = !!(rv.recorded && !rv.body);
     var res = recorded ? null : (rv.result || Inspector.run({ media: rv.media, url: rv.url, title: rv.title, body: rv.body, checklist: rv.checklist }, Store.campaign(rv.campaignId)));
     var ok = rv.adminStatus === 'passed';
+    var pending = rv.adminStatus === 'submitted';
     return '<div class="done-wrap" style="text-align:left">' +
       '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">' +
         (recorded
           ? '<span class="gb ' + (ok ? 'a' : 'red') + '" style="height:34px;padding:0 13px;font-size:13px">' + (ok ? '통과' : '수정요청') + '</span>'
           : ViewIndex.ring(res.score, ok ? 'A' : 'B', 78)) +
-        '<div><span class="status ' + (ok ? 'passed' : 'fix') + '">' + (ok ? '검수 통과' : '수정 요청') + '</span>' +
-        '<h2 style="margin:8px 0 2px">' + (ok ? '검수에 통과했습니다' : '수정이 필요한 항목이 있습니다') + '</h2>' +
+        '<div><span class="status ' + (ok ? 'passed' : (pending ? 'submitted' : 'fix')) + '">' + (ok ? '검수 통과' : (pending ? '검수 대기' : '수정 요청')) + '</span>' +
+        '<h2 style="margin:8px 0 2px">' + (ok ? '검수에 통과했습니다' : (pending ? '자동 검수 결과가 접수되었습니다' : '수정이 필요한 항목이 있습니다')) + '</h2>' +
         '<p class="tiny">' + U.esc(rv.title || '') + '</p></div></div>' +
       (recorded
         ? '<div class="inspect-list"><div class="il ' + (ok ? 'pass' : 'fail') + '">' + icon(ok ? 'check' : 'x') +
@@ -3382,9 +3715,11 @@ var ViewMy = {
         '<div><span>제출일</span><span>' + U.fmtFull(rv.submittedAt) + '</span></div>' +
         '<div><span>일방문자</span><span>' + (rv.visitors != null ? U.fmtNum(rv.visitors) : '미확인') + '</span></div>' +
         '<div><span>공감 / 댓글</span><span>' + (rv.likes != null ? U.fmtNum(rv.likes) + ' / ' + U.fmtNum(rv.comments) : '미확인') + '</span></div></div>' +
-      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap">' +
+        '<button class="btn btn-ghost" type="button" data-act="closeModal">확인</button>' +
+        '<button class="btn btn-ghost" type="button" data-act="openGuideline" data-id="' + app.id + '">' + icon('book') + '가이드라인</button>' +
         '<button class="btn btn-ghost" type="button" data-act="openUrl" data-url="' + U.esc(rv.url) + '">' + icon('external') + '포스팅 열기</button>' +
-        '<button class="btn btn-primary" type="button" data-act="closeModal">확인</button></div></div>';
+        (!ok ? '<button class="btn btn-primary" type="button" data-act="startReview" data-id="' + app.id + '">' + icon('edit') + '수정 후 재제출</button>' : '') + '</div></div>';
   },
 
   render: function () {
@@ -3670,6 +4005,7 @@ var ViewAdmin = {
       '<div class="m-foot"><button class="btn btn-ghost" type="button" data-act="closeModal">닫기</button>' +
         '<button class="btn btn-ghost" type="button" data-act="openUrl" data-url="' + U.esc(cr.blogUrl || '') + '">' + icon('external') + '블로그 열기</button>' +
         (app.status !== 'selected' ? '<button class="btn btn-ink" type="button" data-act="setStatus" data-id="' + app.id + '" data-status="selected">선정</button>' : '') +
+        (['selected', 'visited'].indexOf(app.status) >= 0 ? '<button class="btn btn-ghost" type="button" data-act="setStatus" data-id="' + app.id + '" data-status="selected">' + icon('send') + '선정 안내 문구</button>' : '') +
         (app.status === 'selected' ? '<button class="btn btn-primary" type="button" data-act="setStatus" data-id="' + app.id + '" data-status="visited">방문 완료 처리</button>' : '') +
         (['selected', 'visited'].indexOf(app.status) >= 0 ? '<button class="btn btn-danger" type="button" data-act="setStatus" data-id="' + app.id + '" data-status="noshow">노쇼</button>' : '') +
       '</div></div>';
@@ -3708,33 +4044,51 @@ var ViewAdmin = {
   },
 
   reviewDetail: function (rv) {
-    var c = Store.campaign(rv.campaignId) || CAMPAIGNS[0];
+    var app = Store.app(rv.appId) || {};
+    var c = Store.campaignForReview(Store.campaign(rv.campaignId) || CAMPAIGNS[0], app);
     var cr = Store.creator(rv.creatorId) || {};
     var ok = rv.adminStatus === 'passed';
     /* 실측 포스팅은 본문을 보관하지 않으므로 자동 재검수 대신 기록된 검수 결과를 보여 준다. */
     var recorded = !!(rv.recorded && !rv.body);
     var res = recorded ? null : (rv.result || Inspector.run({ media: rv.media, url: rv.url, title: rv.title, body: rv.body, checklist: rv.checklist }, c));
+    var liveFix = res ? res.fixes : [];
     var fixText = '[' + (c.store || '') + '] 리뷰 수정 요청\n' + (recorded
       ? (rv.adminNote ? '· ' + rv.adminNote : '· 수정 사항이 없습니다.')
-      : (res.fixes.length ? res.fixes.join('\n') : '· 수정 사항이 없습니다.'));
+      : (liveFix.length ? liveFix.join('\n') : '· 수정 사항이 없습니다.'));
+    var rankRows = [], seen = {};
+    [c.keywords.main].concat(rv.assignedKeyword ? [rv.assignedKeyword] : []).concat(c.keywords.subs || []).forEach(function (k) {
+      if (!k || seen[k]) return;
+      seen[k] = 1; rankRows.push(k);
+    });
+    var rankOf = function (kw, kind) {
+      var hit = (rv.ranks || []).filter(function (x) { return x.kw === kw; })[0];
+      return hit && hit[kind] != null ? hit[kind] : '';
+    };
+    var numVal = function (v) { return v == null ? '' : v; };
+    var fixChips = ['메인 키워드 누락', '개별 키워드 누락', '대가성 문구 없음', '영업시간 표기 오류', '필수 해시태그 누락', '사진 수 부족', '본문 분량 부족'];
+
     return '<div class="panel"><div class="panel-head"><h3>' + icon('doc') + U.esc(cr.name) + ' · ' + U.esc(c.store || '') + '</h3>' +
-      '<span class="status ' + (ok ? 'passed' : 'submitted') + '">' + (ok ? '검수 통과' : '수정 요청') + '</span></div>' +
+      '<span class="status ' + (ok ? 'passed' : (rv.adminStatus === 'fix' ? 'fix' : 'submitted')) + '">' +
+        (ok ? '검수 통과' : (rv.adminStatus === 'fix' ? '수정 요청' : '검수 대기')) + '</span></div>' +
       '<div class="panel-body">' +
         '<div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">' +
           (recorded
             ? '<span class="gb ' + (ok ? 'a' : 'red') + '" style="height:30px;padding:0 11px;font-size:12px">' + (ok ? '통과' : '수정요청') + '</span>'
             : '<div class="score-ring">' + ViewIndex.ring(res.score, ok ? 'A' : 'B', 64) + '</div>') +
           '<div style="min-width:0"><b style="display:block;font-size:13.5px;font-weight:800;line-height:1.4">' + U.esc(rv.title || '(제목 없음)') + '</b>' +
-            '<a class="tiny" href="' + U.esc(rv.url) + '" target="_blank" rel="noopener" style="color:var(--coral-2);font-weight:800">' + U.esc(rv.url) + '</a></div>' +
+            '<a class="tiny" href="' + U.esc(rv.url) + '" target="_blank" rel="noopener" style="color:var(--coral-2);font-weight:800">' + U.esc(rv.url) + '</a>' +
+            '<div class="tiny" style="margin-top:3px">' +
+              (rv.assignedKeyword ? '배정 키워드 · <b style="color:var(--coral-2)">' + U.esc(rv.assignedKeyword) + '</b>' : '배정 키워드 · 메인 사용') +
+              (rv.revision > 1 ? ' · 재제출 ' + rv.revision + '회차' : '') + '</div></div>' +
         '</div>' +
         '<div class="kpis" style="grid-template-columns:repeat(4,1fr);margin-bottom:10px">' +
           '<div class="kpi" style="box-shadow:none"><div class="k-lab">일방문자</div><b style="font-size:16px">' + (rv.visitors != null ? U.fmtNum(rv.visitors) : '-') + '</b></div>' +
           '<div class="kpi" style="box-shadow:none"><div class="k-lab">공감</div><b style="font-size:16px">' + (rv.likes != null ? rv.likes : '-') + '</b></div>' +
           '<div class="kpi" style="box-shadow:none"><div class="k-lab">댓글</div><b style="font-size:16px">' + (rv.comments != null ? rv.comments : '-') + '</b></div>' +
-          '<div class="kpi" style="box-shadow:none"><div class="k-lab">사진</div><b style="font-size:16px">' + (rv.photos != null ? rv.photos : (rv.checklist.photos || 0)) + '장</b></div></div>' +
+          '<div class="kpi" style="box-shadow:none"><div class="k-lab">사진</div><b style="font-size:16px">' + (rv.photos != null ? rv.photos : ((rv.checklist && rv.checklist.photos) || 0)) + '장</b></div></div>' +
         (recorded
           ? '<div class="inspect-list">' +
-              '<div class="il ' + (ok ? 'pass' : 'fail') + '">' + icon(ok ? 'check' : 'x') + '<span><b>검수 결과</b> · ' + (ok ? '통과 (2026-11-25 17:00 기록)' : '수정 요청 (2026-11-25 17:00 기록)') + '</span></div>' +
+              '<div class="il ' + (ok ? 'pass' : 'fail') + '">' + icon(ok ? 'check' : 'x') + '<span><b>검수 결과</b> · ' + (ok ? '통과' : '수정 요청') + ' 기록</span></div>' +
               '<div class="il ' + (ok ? 'pass' : 'warn') + '">' + icon(ok ? 'check' : 'alert') + '<span><b>사유</b> · ' + U.esc(rv.adminNote || '기록된 사유 없음') + '</span></div>' +
               '<div class="il pass">' + icon('info') + '<span><b>본문</b> · 실측 포스팅은 본문을 보관하지 않아 자동 재검수를 하지 않습니다. 포스팅 링크에서 직접 확인하세요.</span></div>' +
             '</div>'
@@ -3742,13 +4096,32 @@ var ViewAdmin = {
               var ic = it.status === 'pass' ? 'check' : (it.status === 'warn' ? 'alert' : 'x');
               return '<div class="il ' + it.status + '">' + icon(ic) + '<span><b>' + U.esc(it.label) + '</b> · ' + U.esc(it.detail) + '</span></div>';
             }).join('') + '</div>') +
+        '<div class="settings-sec"><h3>' + icon('chart') + '포스팅 인사이트 측정 <span class="tiny" style="font-weight:700">성과 보고서에 바로 반영</span></h3>' +
+          '<div class="form-grid" style="grid-template-columns:repeat(auto-fit,minmax(112px,1fr))">' +
+            '<div class="field"><label for="insVisitors">일방문자</label><input class="input" id="insVisitors" type="number" min="0" inputmode="numeric" value="' + numVal(rv.visitors) + '" placeholder="예: 210"></div>' +
+            '<div class="field"><label for="insLikes">공감 수</label><input class="input" id="insLikes" type="number" min="0" inputmode="numeric" value="' + numVal(rv.likes) + '" placeholder="예: 18"></div>' +
+            '<div class="field"><label for="insComments">댓글 수</label><input class="input" id="insComments" type="number" min="0" inputmode="numeric" value="' + numVal(rv.comments) + '" placeholder="예: 6"></div>' +
+            '<div class="field"><label for="insPhotos">사진 수</label><input class="input" id="insPhotos" type="number" min="0" inputmode="numeric" value="' + numVal(rv.photos) + '" placeholder="예: 24"></div>' +
+          '</div>' +
+          '<div class="tbl-wrap" style="margin-top:8px"><table class="mini"><thead><tr><th>키워드별 노출 순위</th><th style="width:86px">통합 검색</th><th style="width:86px">블로그탭</th></tr></thead><tbody>' +
+            rankRows.map(function (kw) {
+              return '<tr><td style="font-weight:800">' + U.esc(kw) + '</td>' +
+                '<td><input class="input" type="number" min="1" max="100" data-rank-kw="' + U.esc(kw) + '" data-rank-kind="total" value="' + rankOf(kw, 'rank') + '" placeholder="권외" aria-label="' + U.esc(kw) + ' 통합 순위" style="height:32px;font-size:12px"></td>' +
+                '<td><input class="input" type="number" min="1" max="100" data-rank-kw="' + U.esc(kw) + '" data-rank-kind="blog" value="' + rankOf(kw, 'blog') + '" placeholder="권외" aria-label="' + U.esc(kw) + ' 블로그탭 순위" style="height:32px;font-size:12px"></td></tr>';
+            }).join('') + '</tbody></table></div>' +
+          '<div style="display:flex;gap:7px;align-items:center;margin-top:7px;flex-wrap:wrap">' +
+            '<button class="btn btn-soft btn-sm" type="button" data-act="saveInsight" data-id="' + rv.id + '">' + icon('check') + '인사이트 저장</button>' +
+            '<span class="tiny">' + (rv.insightAt ? '최근 저장 ' + U.fmtFull(rv.insightAt) : '아직 입력 전') + ' · 비우면 권외로 집계됩니다.</span></div></div>' +
         '<div class="settings-sec"><h3>' + icon('edit') + '비밀댓글 · 수정 요청 문구</h3>' +
+          '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">' + fixChips.map(function (t) {
+            return '<button class="chip" type="button" style="height:27px;font-size:11px" data-act="fixChip" data-text="' + U.esc(t) + '">+ ' + U.esc(t) + '</button>';
+          }).join('') + '</div>' +
           '<textarea id="fixText" rows="4" style="font-size:12px">' + U.esc(fixText) + '</textarea>' +
           '<div style="display:flex;gap:6px;margin-top:7px;flex-wrap:wrap">' +
             '<button class="btn btn-ghost btn-sm" type="button" data-act="copyFixes" data-id="' + rv.id + '">' + icon('copy') + '문구 복사</button>' +
             '<button class="btn btn-mint btn-sm" type="button" data-act="reviewDecision" data-id="' + rv.id + '" data-status="passed">' + icon('check') + '검수 통과</button>' +
             '<button class="btn btn-danger btn-sm" type="button" data-act="reviewDecision" data-id="' + rv.id + '" data-status="fix">' + icon('edit') + '수정 요청</button>' +
-          '</div></div>' +
+          '</div><p class="tiny" style="margin-top:5px">' + icon('lock') + ' 블로그 비밀댓글로 안내하거나 카톡으로 그대로 보내세요. 항목을 누르면 문구에 추가됩니다.</p></div>' +
         '<div class="settings-sec"><h3>' + icon('info') + '관리 메모</h3>' +
           '<input class="input" id="adminNote" value="' + U.esc(rv.adminNote || '') + '" placeholder="내부 메모 · 클라이언트 보고서에는 포함되지 않습니다"></div>' +
       '</div></div>';
@@ -3949,25 +4322,47 @@ var ViewAdmin = {
     if (!c) return '';
     var cap = Store.capacityOf(c);
     var dl = U.dday(Store.deadline(c));
+    var kw = c.keywords || { main: '', subs: [], tags: [] };
+    var h = c.hours || { open: '', close: '' };
+    var blocked = (c.blocked || [])[0] || { from: '', to: '', label: '' };
+    var m = c.mission || {};
     return '<div class="m-pad"><div class="m-head"><h2>캠페인 수정 · ' + U.esc(c.id) + '</h2>' +
-      '<p class="sub">' + U.esc(c.store) + '</p></div>' +
-      '<form id="editCampForm" data-id="' + c.id + '"><div class="form-grid">' +
-        '<div class="field full"><label for="ecName">캠페인명</label>' +
-          '<input class="input" id="ecName" value="' + U.esc(c.campaignName) + '"></div>' +
-        '<div class="field"><label for="ecMain">메인 키워드</label>' +
-          '<input class="input" id="ecMain" value="' + U.esc(c.keywords.main) + '"></div>' +
-        '<div class="field"><label for="ecCap">모집 인원</label>' +
-          '<input class="input" id="ecCap" type="number" min="' + cap.confirmed + '" max="60" value="' + cap.capacity + '"></div>' +
-        '<div class="field full"><label for="ecProvide">제공 내역</label>' +
-          '<input class="input" id="ecProvide" value="' + U.esc(c.provide) + '"></div>' +
-        '<div class="field"><label for="ecDays">마감까지(일)</label>' +
-          '<input class="input" id="ecDays" type="number" min="1" value="' + (dl.n > 0 ? dl.n : 7) + '"></div>' +
+      '<p class="sub">' + U.esc(c.store) + ' · 가이드라인 항목은 블로거 [내 활동 → 가이드라인]에 그대로 표시됩니다.</p></div>' +
+      '<form id="editCampForm" data-id="' + c.id + '">' +
+      '<div class="settings-sec" style="margin-top:0"><h3>' + icon('grid') + '기본 정보</h3><div class="form-grid">' +
+        '<div class="field full"><label for="ecName">캠페인명</label><input class="input" id="ecName" value="' + U.esc(c.campaignName) + '"></div>' +
+        '<div class="field"><label for="ecMain">메인 키워드</label><input class="input" id="ecMain" value="' + U.esc(kw.main) + '"></div>' +
+        '<div class="field"><label for="ecSubs">서브·개별 키워드 <span class="tiny">(쉼표 구분)</span></label><input class="input" id="ecSubs" value="' + U.esc((kw.subs || []).join(', ')) + '"></div>' +
+        '<div class="field full"><label for="ecTags">필수 해시태그 <span class="tiny">(쉼표 구분)</span></label><input class="input" id="ecTags" value="' + U.esc((kw.tags || []).join(', ')) + '"></div>' +
+        '<div class="field"><label for="ecCap">모집 인원</label><input class="input" id="ecCap" type="number" min="' + cap.confirmed + '" max="60" value="' + cap.capacity + '"></div>' +
         '<div class="field"><label for="ecStatus">상태</label><select class="input" id="ecStatus">' +
           [['open', '모집중'], ['closed', '마감'], ['ended', '종료']].map(function (x) {
             return '<option value="' + x[0] + '"' + (c.status === x[0] ? ' selected' : '') + '>' + x[1] + '</option>';
           }).join('') + '</select></div>' +
-      '</div>' +
-      '<div class="notice" style="margin-top:10px;font-size:11.5px">' + icon('info') + ' <span style="margin-left:4px">모집 인원은 확정 인원(' + cap.confirmed + '명) 아래로 줄일 수 없습니다. 마감일은 오늘부터 일수로 다시 계산됩니다.</span></div>' +
+        '<div class="field"><label for="ecDays">모집 마감까지(일)</label><input class="input" id="ecDays" type="number" min="1" value="' + (dl.n > 0 ? dl.n : 7) + '"></div>' +
+        '<div class="field"><label for="ecPostDays">포스팅 마감(방문 후 일)</label><input class="input" id="ecPostDays" type="number" min="1" max="30" value="' + ((m.postDays || c.postDays || 7)) + '"></div>' +
+      '</div></div>' +
+      '<div class="settings-sec"><h3>' + icon('pin') + '매장 · 방문 정보</h3><div class="form-grid">' +
+        '<div class="field"><label for="ecArea">지역 · 상권</label><input class="input" id="ecArea" value="' + U.esc(c.area || '') + '" placeholder="예: 대구 중구 교동"></div>' +
+        '<div class="field"><label for="ecAddress">주소</label><input class="input" id="ecAddress" value="' + U.esc(c.address || '') + '" placeholder="예: 대구 중구 경상감영길 181 2층"></div>' +
+        '<div class="field"><label for="ecOpen">영업 시작</label><input class="input" id="ecOpen" type="time" value="' + U.esc(h.open || '') + '"></div>' +
+        '<div class="field"><label for="ecClose">영업 종료</label><input class="input" id="ecClose" type="time" value="' + U.esc(h.close || '') + '"></div>' +
+        '<div class="field"><label for="ecBlockLabel">방문 제외 시간 이름</label><input class="input" id="ecBlockLabel" value="' + U.esc(blocked.label || '') + '" placeholder="예: 피크타임 제외"></div>' +
+        '<div class="field"><label for="ecBlockFrom">제외 시작</label><input class="input" id="ecBlockFrom" type="time" value="' + U.esc(blocked.from || '') + '"></div>' +
+        '<div class="field"><label for="ecBlockTo">제외 종료</label><input class="input" id="ecBlockTo" type="time" value="' + U.esc(blocked.to || '') + '"></div>' +
+        '<div class="field full"><label for="ecProvide">제공 내역</label><input class="input" id="ecProvide" value="' + U.esc(c.provide) + '" placeholder="예: 시그니처 플래터 + 하이볼 2잔 (2인)"></div>' +
+      '</div></div>' +
+      '<div class="settings-sec"><h3>' + icon('checklist') + '미션 · 검수 기준</h3><div class="form-grid">' +
+        '<div class="field"><label for="ecMinPhotos">필수 사진 수</label><input class="input" id="ecMinPhotos" type="number" min="0" max="30" value="' + (m.minPhotos || 0) + '"></div>' +
+        '<div class="field"><label for="ecMinChars">본문 최소 글자</label><input class="input" id="ecMinChars" type="number" min="0" step="50" value="' + (m.minChars || 0) + '"></div>' +
+        '<div class="field full"><label for="ecMission">미션 항목 <span class="tiny">(줄바꿈으로 구분)</span></label><textarea id="ecMission" rows="3">' + U.esc((m.items || []).join('\n')) + '</textarea></div>' +
+        '<label class="consent" style="margin-top:0"><input type="checkbox" id="ecReceipt"' + (m.receipt ? ' checked' : '') + '><span>영수증 인증 필요</span></label>' +
+      '</div></div>' +
+      '<div class="settings-sec"><h3>' + icon('shield') + '공정위 대가성 문구</h3>' +
+        '<textarea id="ecDisclosure" rows="2" placeholder="비우면 ‘{브랜드} {매장}에서 {제공 내역}를 제공받아 작성한 솔직한 후기입니다.’로 자동 생성됩니다.">' + U.esc(c.disclosure || '') + '</textarea></div>' +
+      '<div class="settings-sec"><h3>' + icon('alert') + '방문 주의사항</h3>' +
+        '<textarea id="ecNotes" rows="3" placeholder="한 줄에 하나씩">' + U.esc((c.notes || []).join('\n')) + '</textarea></div>' +
+      '<div class="notice" style="margin-top:10px;font-size:11.5px">' + icon('info') + ' <span style="margin-left:4px">모집 인원은 확정 인원(' + cap.confirmed + '명) 아래로 줄일 수 없습니다. 저장한 가이드라인은 선정된 블로거 화면에 바로 반영됩니다.</span></div>' +
       '<div class="form-actions" style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">' +
         '<button class="btn btn-ghost" type="button" data-act="closeModal">취소</button>' +
         '<button class="btn btn-primary" type="submit">' + icon('check') + '저장</button></div></form></div>';
@@ -3982,10 +4377,14 @@ var ViewAdmin = {
         '<div class="field"><label for="ncStore">매장명</label><input class="input" id="ncStore" placeholder="예: 커브 동성로점"></div>' +
         '<div class="field full"><label for="ncName">캠페인명</label><input class="input" id="ncName" placeholder="예: 12월 신메뉴 블로그 체험단"></div>' +
         '<div class="field"><label for="ncMain">메인 키워드</label><input class="input" id="ncMain" placeholder="예: 대구 브런치 카페"></div>' +
+        '<div class="field"><label for="ncSubs">서브 키워드 <span class="tiny">(쉼표 구분)</span></label><input class="input" id="ncSubs" placeholder="예: 동성로 베이커리, 대구 크루아상"></div>' +
+        '<div class="field full"><label for="ncAddress">주소</label><input class="input" id="ncAddress" placeholder="예: 대구 중구 동성로2길 12 1층"></div>' +
         '<div class="field"><label for="ncCap">모집 인원</label><input class="input" id="ncCap" type="number" min="1" value="5"></div>' +
         '<div class="field"><label for="ncProvide">제공 내역</label><input class="input" id="ncProvide" placeholder="예: 시그니처 세트 2인"></div>' +
-        '<div class="field"><label for="ncDays">마감까지(일)</label><input class="input" id="ncDays" type="number" min="1" value="14"></div>' +
-      '</div><div class="notice" style="margin-top:10px">' + icon('info') + ' <span style="margin-left:4px">단계별 미션·영업시간·제외 시간은 등록 후 상세에서 채웁니다.</span></div>' +
+        '<div class="field"><label for="ncMinPhotos">필수 사진 수</label><input class="input" id="ncMinPhotos" type="number" min="0" value="6"></div>' +
+        '<div class="field"><label for="ncDays">모집 마감까지(일)</label><input class="input" id="ncDays" type="number" min="1" value="14"></div>' +
+        '<div class="field full"><label for="ncDisclosure">공정위 대가성 문구 <span class="tiny">(선택)</span></label><textarea id="ncDisclosure" rows="2" placeholder="비우면 자동 문구를 사용합니다."></textarea></div>' +
+      '</div><div class="notice" style="margin-top:10px">' + icon('info') + ' <span style="margin-left:4px">등록 후 [수정]에서 영업시간·제외 시간·미션·주의사항까지 채울 수 있습니다.</span></div>' +
       '<div class="form-actions" style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">' +
         '<button class="btn btn-ghost" type="button" data-act="closeModal">취소</button>' +
         '<button class="btn btn-primary" type="submit">' + icon('plus') + '등록</button></div></form></div>';
@@ -4042,51 +4441,100 @@ var ViewAdmin = {
 
 var ViewReport = {
   /* 실측 보고서(CMP-001)가 있으면 실데이터, 아니면 현재 신청·검수 데이터로 집계 */
+  totalsOf: function (posts) {
+    var v = posts.reduce(function (s, p) { return s + (Number(p.visitors) || 0); }, 0);
+    var l = posts.reduce(function (s, p) { return s + (Number(p.likes) || 0); }, 0);
+    var cm = posts.reduce(function (s, p) { return s + (Number(p.comments) || 0); }, 0);
+    var ph = posts.reduce(function (s, p) { return s + (Number(p.photos) || 0); }, 0);
+    return { posts: posts.length, visitors: v, likes: l, comments: cm, photos: ph, engagement: l + cm, reach: Math.floor(v * 1.5) };
+  },
+  bestRank: function (rv) {
+    var best = null;
+    (rv.ranks || []).forEach(function (x) { if (x.rank != null && (best == null || x.rank < best.rank)) best = x; });
+    return best;
+  },
   build: function (campaignId) {
     var c = Store.campaign(campaignId) || CAMPAIGNS[0];
     var b = Store.brand(c.brand);
-    if (campaignId === REPORT_2026_11.campaignId) {
+    var measured = campaignId === REPORT_2026_11.campaignId;
+    var keywords = [];
+    var posts = [];
+
+    if (measured) {
       var R = REPORT_2026_11;
-      var posts = POSTS_2026_11.map(function (p) {
+      keywords = JSON.parse(JSON.stringify(R.keywords));
+      posts = POSTS_2026_11.map(function (p) {
         var cr = Store.creator(p.creatorId) || {};
+        var rv = Store.state.reviews.filter(function (r) { return r.campaignId === campaignId && r.creatorId === p.creatorId; })[0];
+        var best = rv ? ViewReport.bestRank(rv) : null;
         return {
           no: p.no, name: cr.name || '', visit: p.visit, pub: p.pub, kw: p.kwRaw,
-          visitors: p.visitors, likes: p.likes, comments: p.comments, photos: p.photos,
-          rank: p.rank, rankKw: p.rankKw, url: p.url, title: p.title
+          visitors: rv && rv.visitors != null ? rv.visitors : p.visitors,
+          likes: rv && rv.likes != null ? rv.likes : p.likes,
+          comments: rv && rv.comments != null ? rv.comments : p.comments,
+          photos: rv && rv.photos != null ? rv.photos : p.photos,
+          rank: best ? best.blog || best.rank : p.rank, rankKw: best ? best.kw : p.rankKw,
+          url: p.url, title: p.title, creatorId: p.creatorId
         };
+      });
+      /* 관리자가 입력한 키워드 순위를 실측 표에 덧붙인다. */
+      Store.reviewsOfCampaign(campaignId).forEach(function (rv) {
+        var cr = Store.creator(rv.creatorId) || {};
+        (rv.ranks || []).forEach(function (x) {
+          if (x.rank == null) return;
+          var k = keywords.filter(function (y) { return y.kw === x.kw; })[0];
+          if (!k) { k = { kw: x.kw, used: 0, ranked: [] }; keywords.push(k); }
+          k.ranked = (k.ranked || []).filter(function (e) { return e[0] !== cr.name; });
+          k.ranked.push([cr.name, x.rank, x.blog != null ? x.blog : null]);
+        });
       });
       return {
         campaign: c, brand: b, store: R.store, title: c.campaignName, period: R.period, written: R.written,
-        posts: posts, totals: R.totals, keywords: R.keywords, buckets: R.buckets, menuMentions: R.menuMentions,
+        posts: posts, totals: ViewReport.totalsOf(posts), keywords: keywords, buckets: R.buckets, menuMentions: R.menuMentions,
         measured: true, month: '2026-11'
       };
     }
-    /* 그 외 캠페인: 상태 데이터로 집계 (표본 부족 시 안내) */
+
+    /* 그 외 캠페인: 관리자·체험단이 입력한 실제 검수·인사이트 데이터로 집계 */
     var reviews = Store.reviewsOfCampaign(c.id);
     var apps = Store.appsOfCampaign(c.id).filter(function (a) { return !a.history; });
-    var posts = reviews.map(function (r, i) {
+    posts = reviews.map(function (r, i) {
       var cr = Store.creator(r.creatorId) || {};
       var app = Store.app(r.appId) || {};
-      return { no: i + 1, name: cr.name || '', visit: app.visitAt ? U.fmtMD(app.visitAt) : '-', pub: r.submittedAt,
-        kw: c.keywords.main, visitors: r.visitors || 0, likes: r.likes || 0, comments: r.comments || 0,
-        photos: r.photos || (r.checklist ? r.checklist.photos : 0), rank: null, rankKw: c.keywords.main, url: r.url, title: r.title };
+      var best = ViewReport.bestRank(r);
+      return {
+        no: i + 1, name: cr.name || '', visit: app.visitAt ? U.fmtMD(app.visitAt) : '-', pub: r.submittedAt,
+        kw: r.assignedKeyword || c.keywords.main,
+        visitors: r.visitors || 0, likes: r.likes || 0, comments: r.comments || 0,
+        photos: r.photos != null ? r.photos : ((r.checklist && r.checklist.photos) || 0),
+        rank: best ? best.rank : null, rankKw: best ? best.kw : c.keywords.main,
+        url: r.url, title: r.title, creatorId: r.creatorId
+      };
     });
-    var totals = {
-      posts: posts.length,
-      visitors: posts.reduce(function (s, p) { return s + p.visitors; }, 0),
-      likes: posts.reduce(function (s, p) { return s + p.likes; }, 0),
-      comments: posts.reduce(function (s, p) { return s + p.comments; }, 0),
-      photos: posts.reduce(function (s, p) { return s + p.photos; }, 0),
-      engagement: posts.reduce(function (s, p) { return s + p.likes + p.comments; }, 0),
-      reach: Math.round(posts.reduce(function (s, p) { return s + p.visitors; }, 0) * 1.5)
-    };
-    var keywords = [c.keywords.main].concat(c.keywords.subs).map(function (k) {
-      return { kw: k, used: posts.length, ranked: [] };
+    var kwList = [];
+    var addKw = function (k) { if (k && kwList.indexOf(k) < 0) kwList.push(k); };
+    addKw(c.keywords.main);
+    (c.keywords.subs || []).forEach(addKw);
+    reviews.forEach(function (r) { addKw(r.assignedKeyword); });
+    keywords = kwList.map(function (k) {
+      var used = posts.filter(function (p) {
+        if (p.kw === k) return true;
+        var rv = reviews.filter(function (r) { return r.creatorId === p.creatorId; })[0];
+        return rv && rv.body ? rv.body.indexOf(k) >= 0 : false;
+      }).length;
+      var ranked = [];
+      reviews.forEach(function (r) {
+        (r.ranks || []).forEach(function (x) {
+          if (x.kw !== k || (x.rank == null && x.blog == null)) return;
+          ranked.push([(Store.creator(r.creatorId) || {}).name || '', x.rank, x.blog != null ? x.blog : null]);
+        });
+      });
+      return { kw: k, used: used, ranked: ranked };
     });
     return {
       campaign: c, brand: b, store: c.store, title: c.campaignName,
       period: '2026년 11월 1일 ~ 11월 30일', written: U.fmtFull(U.iso(U.today())) + ' 기준',
-      posts: posts, totals: totals, keywords: keywords, buckets: [], menuMentions: [],
+      posts: posts, totals: ViewReport.totalsOf(posts), keywords: keywords, buckets: [], menuMentions: [],
       measured: false, month: '2026-11', apps: apps
     };
   },
@@ -4129,9 +4577,12 @@ var ViewReport = {
     }).join('') + '</div>';
   },
 
+  rankNum: function (r) { return r && r[1] != null ? r[1] : (r && r[2] != null ? r[2] : null); },
   rankedCount: function () {
     var n = 0;
-    (App.reportData ? App.reportData.keywords : []).forEach(function (k) { n += (k.ranked || []).length; });
+    (App.reportData ? App.reportData.keywords : []).forEach(function (k) {
+      (k.ranked || []).forEach(function (r) { if (ViewReport.rankNum(r) != null) n++; });
+    });
     return n;
   },
 
@@ -4154,7 +4605,7 @@ var ViewReport = {
           '<td class="num">' + U.fmtNum(p.likes) + '</td>' +
           '<td class="num">' + U.fmtNum(p.comments) + '</td>' +
           '<td class="num">' + U.fmtNum(p.photos) + '</td>' +
-          '<td>' + (p.rank ? '<span class="rank-pill' + (p.rank <= 15 ? ' top' : '') + '">' + p.rank + '위</span>' : '<span class="rank-pill none">-</span>') + '</td>' +
+          '<td>' + (p.rank ? '<span class="rank-pill' + (p.rank <= 15 ? ' top' : '') + '" title="' + U.esc(p.rankKw || '') + '">' + p.rank + '위</span>' : '<span class="rank-pill none">-</span>') + '</td>' +
           '<td><a href="' + U.esc(p.url) + '" target="_blank" rel="noopener">' + icon('external') + '</a></td>' +
         '</tr>';
       }).join('') + '</tbody>' +
@@ -4173,10 +4624,14 @@ var ViewReport = {
         return '<tr><td><b style="font-weight:800">' + U.esc(k.kw) + '</b></td>' +
           '<td class="num">' + k.used + '건</td>' +
           '<td>' + (ranked.length
-            ? ranked.map(function (r) { return '<span class="rank-pill' + (r[1] <= 15 ? ' top' : '') + '" style="margin-right:3px">' + U.esc(r[0]) + ' ' + r[1] + '위</span>'; }).join('')
+            ? ranked.map(function (r) {
+              var n = r[1] != null ? r[1] : r[2];
+              return '<span class="rank-pill' + (n != null && n <= 15 ? ' top' : '') + '" style="margin-right:3px">' + U.esc(r[0]) +
+                (r[1] != null ? ' ' + r[1] + '위' : '') + (r[2] != null ? ' · 블로그 ' + r[2] + '위' : '') + '</span>';
+            }).join('')
             : '<span class="rank-pill none">30위 내 미노출</span>') + '</td></tr>';
       }).join('') + '</tbody></table></div>' +
-      '<p class="sh-note">· 네이버 블로그 검색 노출 기준(2026-11-26 실측). 순위는 검색 환경·개인화에 따라 달라질 수 있습니다.</p>';
+      '<p class="sh-note">· 네이버 검색 노출 기준' + (rep.measured ? '(2026-11-26 실측)' : '(관리자 인사이트 입력 기준)') + '. 순위는 검색 환경·개인화에 따라 달라질 수 있습니다.</p>';
   },
 
   charts: function (rep) {
@@ -4201,7 +4656,11 @@ var ViewReport = {
     var top = rep.posts.slice().sort(function (a, b) { return b.visitors - a.visitors; })[0];
     var best = null;
     (rep.keywords || []).forEach(function (k) {
-      (k.ranked || []).forEach(function (r) { if (!best || r[1] < best.rank) best = { kw: k.kw, name: r[0], rank: r[1] }; });
+      (k.ranked || []).forEach(function (r) {
+        var rk = ViewReport.rankNum(r);
+        if (rk == null) return;
+        if (!best || rk < best.rank) best = { kw: k.kw, name: r[0], rank: rk };
+      });
     });
     var lines = [];
     if (top) lines.push('일방문자 최고 포스팅은 ' + top.name + ' 님의 ' + U.fmtNum(top.visitors) + '명으로, 전체의 ' + Math.round(top.visitors / Math.max(1, t.visitors) * 100) + '%를 차지했습니다.');
@@ -4211,7 +4670,11 @@ var ViewReport = {
       lines.push('본문 메뉴 언급은 ' + rep.menuMentions.map(function (m) { return m.name + ' ' + m.n + '회'; }).join(' · ') + ' 순으로 많았습니다.');
     }
     lines.push('30위 내 노출 ' + ViewReport.rankedCount() + '건 · 15위 내 ' + (function () {
-      var n = 0; (rep.keywords || []).forEach(function (k) { (k.ranked || []).forEach(function (r) { if (r[1] <= 15) n++; }); }); return n;
+      var n = 0;
+      (rep.keywords || []).forEach(function (k) {
+        (k.ranked || []).forEach(function (r) { var rk = ViewReport.rankNum(r); if (rk != null && rk <= 15) n++; });
+      });
+      return n;
     })() + '건으로, 상위 노출 키워드를 다음 달 메인 키워드로 확장할 것을 제안합니다.');
     return '<ul style="display:grid;gap:5px;font-size:10.5px;line-height:1.7;color:var(--ink-2)">' +
       lines.slice(0, 4).map(function (l) { return '<li style="display:flex;gap:5px"><b style="color:var(--coral)">·</b><span>' + U.esc(l) + '</span></li>'; }).join('') + '</ul>';
@@ -4362,21 +4825,51 @@ var App = {
   },
 
   mergeRemote: function (data) {
-    var added = 0;
+    var added = 0, revAdded = 0;
     (data.applications || []).forEach(function (r) {
+      if (String(r.note || '').indexOf('신청자 취소') >= 0) return;
       var local = Store.state.applications.filter(function (a) { return a.remoteId === r.id; })[0];
-      if (local) { local.status = r.status || local.status; return; }
-      if (Store.state.applications.some(function (a) { return a.id === 'AP-' + String(r.id).slice(0, 6); })) return;
+      if (local) {
+        local.status = r.status || local.status;
+        if (r.assigned_keyword) local.assignedKeyword = r.assigned_keyword;
+        if (r.visit_at) local.visitAt = r.visit_at;
+        if (r.visit_time) local.visitTime = r.visit_time;
+        if (r.companions) local.companions = r.companions;
+        return;
+      }
+      if (Store.state.applications.some(function (a) { return a.id === 'AP-R' + String(r.id).slice(0, 5); })) return;
       var cr = BlogIndex.find(r.blog_url || '') || null;
       Store.state.applications.push({
-        id: 'AP-R' + String(r.id).slice(0, 5), remoteId: r.id, campaignId: (CAMPAIGNS.filter(function (c) { return c.store === (r.store || ''); })[0] || {}).id || 'CMP-002',
+        id: 'AP-R' + String(r.id).slice(0, 5), remoteId: r.id,
+        campaignId: (CAMPAIGNS.filter(function (c) { return c.store === (r.store || ''); })[0] || {}).id || 'CMP-002',
         creatorId: cr ? cr.id : '', name: r.creator_name || r.name || '', media: r.media || 'blog', status: r.status || 'review',
         appliedAt: (r.created_at || '').slice(0, 10) || U.iso(U.today()), visitAt: r.visit_at || '', visitTime: r.visit_time || '',
-        contact: r.contact || '', url: r.blog_url || '', note: r.note || '', remote: true
+        contact: r.contact || '', url: r.blog_url || '', blogType: r.blog_type || '',
+        companions: r.companions || 1, requestNote: r.request_note || '', assignedKeyword: r.assigned_keyword || '',
+        visitors: r.visitors != null ? r.visitors : null, remote: true
       });
       added++;
     });
-    if (added) { Store.save(); App.render(); App.toast('Supabase에서 신청 ' + added + '건을 불러왔습니다.'); }
+    (data.reviews || []).forEach(function (r) {
+      if (!r || !r.id) return;
+      if (Store.state.reviews.some(function (x) { return x.remoteId === r.id || (r.url && x.url === r.url); })) return;
+      var cr = CREATORS.filter(function (c) { return c.name === r.creator_name; })[0] || {};
+      Store.state.reviews.push({
+        id: 'RV-R' + String(r.id).slice(0, 5), remoteId: r.id, appId: '', campaignId: r.campaign_id,
+        creatorId: cr.id || '', media: r.media || 'blog', url: r.url || '', title: r.title || '', body: r.body || '',
+        checklist: r.checklist || null, visitors: r.visitors, likes: r.likes, comments: r.comments,
+        photos: r.photos, ranks: r.ranks || [], assignedKeyword: r.assigned_keyword || '',
+        revision: r.revision || 1, recorded: !r.body,
+        submittedAt: (r.submitted_at || '').slice(0, 10) || U.iso(U.today()),
+        adminStatus: r.status || 'submitted', adminNote: r.note || ''
+      });
+      revAdded++;
+    });
+    if (added || revAdded) {
+      Store.save();
+      App.render();
+      App.toast('Supabase에서 신청 ' + added + '건 · 포스팅 ' + revAdded + '건을 불러왔습니다.');
+    }
     App.updateChrome();
   },
 
@@ -4534,8 +5027,18 @@ var App = {
       case 'loadSample': App.loadSample(el.getAttribute('data-kind')); break;
       case 'submitReview': App.submitReview(id); break;
       case 'startReview': App.reviewAppId = id; App.reviewDraft = null; Store.state.ui.mode = 'my'; Store.state.ui.myTab = 'review'; App.closeModal(); App.render(); break;
+      case 'openGuideline': App.openGuideline(id); break;
+      case 'viewResult': App.openModal(ViewMy.resultModal(Store.app(id)), { size: 'narrow' }); break;
+      case 'copyField': App.copyField(el.getAttribute('data-target'), el.getAttribute('data-msg')); break;
       case 'cancelApp': App.confirmCancel(id); break;
       case 'doCancelApp':
+        var cancelApp = Store.app(id);
+        if (cancelApp && DB.configured() && cancelApp.remoteId) {
+          DB.update('applications', cancelApp.remoteId, { status: 'rejected', note: '신청자 취소' });
+        }
+        if (cancelApp && ['selected', 'visited', 'submitted', 'passed', 'fix'].indexOf(cancelApp.status) >= 0) {
+          Store.bumpConfirmed(cancelApp.campaignId, -1);
+        }
         Store.state.applications = Store.state.applications.filter(function (a) { return a.id !== id; });
         Store.save(); App.closeModal(); App.render(); App.toast('신청을 취소했습니다.'); break;
       case 'changeVisit': App.changeVisit(id); break;
@@ -4555,10 +5058,20 @@ var App = {
       /* 관리자 */
       case 'adminTab': Store.state.ui.adminTab = el.getAttribute('data-tab'); App.adminSelected = []; App.render(); break;
       case 'selectGradeA': App.selectGradeA(); break;
-      case 'bulkStatus': App.bulkStatus(el.getAttribute('data-status')); break;
+      case 'bulkStatus':
+        if (el.getAttribute('data-status') === 'selected') App.openBulkSelect();
+        else App.bulkStatus(el.getAttribute('data-status'));
+        break;
       case 'bulkClear': App.adminSelected = []; App.render(); break;
       case 'bulkInvite': App.bulkInvite(); break;
-      case 'setStatus': App.setStatus(id, el.getAttribute('data-status')); break;
+      case 'setStatus':
+        if (el.getAttribute('data-status') === 'selected') App.openSelect(id);
+        else App.setStatus(id, el.getAttribute('data-status'));
+        break;
+      case 'doSelect': App.doSelect(id); break;
+      case 'doBulkSelect': App.doBulkSelect(); break;
+      case 'saveInsight': App.saveInsight(id); break;
+      case 'fixChip': App.addFixChip(el.getAttribute('data-text')); break;
       case 'matchDetail': App.matchDetail(id); break;
       case 'openApplicant': App.openApplicant(id); break;
       case 'pickReview': App.adminReviewId = id; App.render(); break;
@@ -4624,6 +5137,16 @@ var App = {
     if (act === 'adminMatch') { App.adminApps.matchGrade = t.value; App.render(); return; }
     if (act === 'adminSort') { App.adminApps.sort = t.value; App.render(); return; }
     if (act === 'reportCampaign') { App.reportCampaign = t.value; App.render(); return; }
+    if (t.id === 'selDate' || t.id === 'selTime' || t.id === 'selKeyword') {
+      var selApp = Store.app(App.selectId);
+      var ta = document.getElementById('selMsg');
+      if (selApp && ta) {
+        ta.value = App.selectMessage(selApp, Store.campaign(selApp.campaignId) || {},
+          (document.getElementById('selDate') || {}).value, (document.getElementById('selTime') || {}).value,
+          String((document.getElementById('selKeyword') || {}).value || '').trim());
+      }
+      return;
+    }
     if (t.id === 'adminNote') {
       var rv = Store.state.reviews.filter(function (r) { return r.id === App.adminReviewId; })[0];
       if (rv) { rv.adminNote = t.value; Store.save(); }
@@ -4696,6 +5219,7 @@ var App = {
     }
     if (f.id === 'newCampForm') { e.preventDefault(); App.createCampaign(f); return; }
     if (f.id === 'editCampForm') { e.preventDefault(); App.saveCampaign(f); return; }
+    if (f.id === 'selectForm') { e.preventDefault(); App.doSelect(f.getAttribute('data-id')); return; }
   },
 
   /* ------------------------------------------------------------- 캠페인/신청 */
@@ -4709,12 +5233,40 @@ var App = {
     var c = Store.campaign(id);
     if (!c) return;
     if (!Store.state.session) {
-      App.toast('로그인 후 신청할 수 있습니다.', true);
+      App.pendingApply = id;
+      App.toast('로그인하면 신청서로 바로 이어집니다.');
       App.authModal(false);
       return;
     }
+    var blk = Store.applyBlock(c);
+    if (blk.code !== 'ok') { App.applyBlocked(c, blk); return; }
     App.applyCtx = { campaignId: id, media: (c.media || ['blog'])[0] };
     App.openModal(ViewExplore.apply(c, App.applyCtx.media), { size: '' });
+  },
+  /* 로그인 전에 누른 신청을 로그인 직후 이어서 연다. */
+  pendingApply: null,
+  resumePendingApply: function () {
+    var id = App.pendingApply;
+    App.pendingApply = null;
+    if (!id) return;
+    setTimeout(function () { App.startApply(id); }, 140);
+  },
+  applyBlocked: function (c, blk) {
+    if (blk.code === 'login') { App.authModal(false); return; }
+    if (blk.code === 'dup') {
+      App.closeModal();
+      App.nav('my');
+      App.toast(blk.msg, true);
+      return;
+    }
+    App.openModal('<div class="settings-body" style="text-align:center;padding-top:26px">' +
+      '<div class="done-badge" style="background:#FDEDEF;color:var(--red);box-shadow:0 0 0 9px rgba(226,56,79,.07)">' + icon('lock') + '</div>' +
+      '<h2 style="margin-top:14px">' + U.esc(blk.label) + '</h2>' +
+      '<p class="sub">' + U.esc(c.store) + ' · ' + U.esc(c.campaignName) + '<br>' + U.esc(blk.msg) + '</p>' +
+      '<div style="display:flex;gap:8px;justify-content:center;margin-top:16px;flex-wrap:wrap">' +
+        '<button class="btn btn-ghost" type="button" data-act="closeModal">닫기</button>' +
+        (blk.code === 'grade' ? '<button class="btn btn-soft" type="button" data-act="gradeGuide">' + icon('crown') + '등급 혜택 보기</button>' : '') +
+        '<button class="btn btn-primary" type="button" data-act="scrollList">다른 캠페인 보기</button></div></div>', { size: 'narrow' });
   },
 
   submitApply: function (form) {
@@ -4725,7 +5277,10 @@ var App = {
     var url = form.querySelector('#aUrl');
     var visit = form.querySelector('#aVisitDate');
     var time = form.querySelector('#aVisitTime');
+    var companions = form.querySelector('#aCompanions');
+    var noteEl = form.querySelector('#aNote');
     var consent = form.querySelector('#aConsent');
+    var penalty = form.querySelector('#aPenalty');
     Array.prototype.forEach.call(form.querySelectorAll('[aria-invalid]'), function (i) { i.removeAttribute('aria-invalid'); });
     function setErr(input, key, msg) { errs[key] = msg; if (input) input.setAttribute('aria-invalid', 'true'); }
     if (!name.value.trim()) setErr(name, 'eName', '활동명을 입력해 주세요.');
@@ -4735,10 +5290,18 @@ var App = {
     else {
       var norm = /^https?:\/\//i.test(urlVal) ? urlVal : 'https://' + urlVal;
       if (!MEDIA[App.applyCtx.media].urlPattern.test(norm)) setErr(url, 'eUrl', MEDIA[App.applyCtx.media].name + ' 주소 형식이 아닙니다. (' + MEDIA[App.applyCtx.media].urlHint + ')');
+      else urlVal = norm;
     }
     if (!visit.value) setErr(visit, 'eVisit', '방문 희망일을 선택해 주세요.');
-    else if (c.visitType !== 'free' && time && !time.value) setErr(time, 'eTime', '방문 시간을 선택해 주세요.');
+    else if (visit.value < U.iso(U.today())) setErr(visit, 'eVisit', '오늘 이후 날짜를 선택해 주세요.');
+    else {
+      var range = Store.visitRange(c);
+      if (range && (visit.value < range.min || visit.value > range.max)) setErr(visit, 'eVisit', '방문 가능 기간(' + range.min + ' ~ ' + range.max + ') 안에서 선택해 주세요.');
+    }
+    if (c.visitType !== 'free' && time && !time.value) setErr(time, 'eTime', '방문 희망 시간을 선택해 주세요.');
+    if (companions && !companions.value) setErr(companions, 'eCompanions', '동반 인원을 선택해 주세요.');
     if (!consent.checked) setErr(consent, 'eConsent', '개인정보 수집·이용에 동의해 주세요.');
+    if (!penalty.checked) setErr(penalty, 'ePenalty', '노쇼·패널티 규정에 동의해 주세요.');
 
     Array.prototype.forEach.call(form.querySelectorAll('.err'), function (e2) { e2.textContent = ''; });
     var keys = Object.keys(errs);
@@ -4748,6 +5311,12 @@ var App = {
       if (fe && ft) { fe.classList.add('on'); ft.textContent = keys.length + '개 항목을 확인해 주세요. ' + errs[keys[0]]; }
       var first = form.querySelector('[aria-invalid="true"]');
       if (first) first.focus();
+      return;
+    }
+    /* 제출 직전 재확인 — 그 사이 마감·중복이 생겼을 수 있다. */
+    var blk = Store.applyBlock(c);
+    if (blk.code !== 'ok') {
+      if (fe && ft) { fe.classList.add('on'); ft.textContent = blk.msg; }
       return;
     }
     var btn = document.getElementById('submitApply');
@@ -4763,7 +5332,11 @@ var App = {
       blogType: (form.querySelector('input[name="blogType"]:checked') || {}).value || '',
       visitors: Number((form.querySelector('#aVisitors') || {}).value || 0),
       visitAt: visit.value,
-      visitTime: time ? time.value : ''
+      visitTime: time ? time.value : '',
+      companions: companions ? Number(companions.value) : 1,
+      requestNote: noteEl ? noteEl.value.trim() : '',
+      privacyAgreed: true,
+      penaltyAgreed: true
     });
     setTimeout(function () {
       App.openModal(ViewExplore.done(app, c), { size: 'narrow' });
@@ -4822,7 +5395,9 @@ var App = {
       var role = (local && local.role) || 'creator';
       var creator = local && local.blog ? App.creatorForBlog(local.blog) : '';
       Store.setSession({ id: 'local-' + U.hash(email), name: name, email: email.trim(), role: role, creatorId: creator });
-      App.closeModal(); App.render();
+      App.closeModal();
+      if (App.pendingApply) { App.resumePendingApply(); return; }
+      App.render();
       App.toast(name + ' 님, 로그인했습니다. (데모 세션)');
       return;
     }
@@ -4833,7 +5408,9 @@ var App = {
         DB.profile(r.user.id).then(function (p) {
           Store.setSession({ id: r.user.id, name: (p && p.display_name) || r.user.email.split('@')[0], email: r.user.email,
             role: (p && p.role) || 'creator', creatorId: App.creatorForBlog(p && p.blog_url) });
-          App.closeModal(); App.render();
+          App.closeModal();
+          if (App.pendingApply) { App.resumePendingApply(); return; }
+          App.render();
           App.toast('로그인했습니다.');
         });
       });
@@ -4857,7 +5434,9 @@ var App = {
       Store.state.profiles[email.trim().toLowerCase()] = meta;
       Store.setSession({ id: 'local-' + U.hash(email), name: meta.name, email: meta.email, role: role, creatorId: App.creatorForBlog(blog) });
       Store.save();
-      App.closeModal(); App.render();
+      App.closeModal();
+      if (App.pendingApply) { App.resumePendingApply(); return; }
+      App.render();
       App.toast('가입되었습니다. (데모 세션 · 브라우저 저장)');
       return;
     }
@@ -4866,7 +5445,9 @@ var App = {
       DB.signUp(email.trim(), pw, { display_name: name.trim(), role: role, blog_url: blog.trim() }).then(function (r) {
         if (!r.ok) { fail(r.message || '가입에 실패했습니다.'); return; }
         Store.setSession({ id: r.user ? r.user.id : 'pending', name: name.trim(), email: email.trim(), role: role, creatorId: App.creatorForBlog(blog) });
-        App.closeModal(); App.render();
+        App.closeModal();
+        if (App.pendingApply) { App.resumePendingApply(); return; }
+        App.render();
         App.toast(r.needConfirm ? '가입 완료 · 이메일 확인 후 로그인해 주세요.' : '가입 후 로그인했습니다.');
       });
     });
@@ -4874,6 +5455,7 @@ var App = {
 
   demoLogin: function (id) {
     if (id === 'admin') {
+      App.pendingApply = null;
       Store.setSession({ id: 'demo-admin', name: '주팀장 (관리자)', email: 'admin@growthkorea.kr', role: 'admin', creatorId: 'CR-12' });
       App.closeModal(); App.nav('admin');
       App.toast('관리자 데모 세션으로 입장했습니다.');
@@ -4882,7 +5464,13 @@ var App = {
     var cr = Store.creator(id);
     if (!cr) return;
     Store.setSession({ id: 'demo-' + cr.id, name: cr.name, email: (cr.blogId || 'demo') + '@demo.matetrip', role: 'creator', creatorId: cr.id });
-    App.closeModal(); App.nav('my');
+    App.closeModal();
+    if (App.pendingApply) {
+      App.toast(cr.name + ' 님으로 로그인 · 신청서로 이동합니다.');
+      App.resumePendingApply();
+      return;
+    }
+    App.nav('my');
     App.toast(cr.name + ' 님으로 로그인했습니다. (데모)');
   },
 
@@ -5021,7 +5609,7 @@ var App = {
   refreshInspector: function () {
     var app = Store.app(App.reviewAppId);
     if (!app || !App.reviewDraft) return;
-    var c = Store.campaign(app.campaignId);
+    var c = Store.campaignForReview(Store.campaign(app.campaignId), app);
     var panel = document.getElementById('inspectPanel');
     if (!panel) return;
     panel.innerHTML = ViewMy.inspector(Inspector.run(App.reviewDraft, c), c, app);
@@ -5072,10 +5660,24 @@ var App = {
     var d = App.reviewDraft;
     if (!String(d.url || '').trim()) { App.toast('포스팅 링크를 입력해 주세요.', true); return; }
     if (!String(d.body || '').trim()) { App.toast('본문을 입력해 주세요.', true); return; }
-    var c = Store.campaign(app.campaignId);
+    var c = Store.campaignForReview(Store.campaign(app.campaignId), app);
     var result = Inspector.run(d, c);
-    Store.addReview({ appId: app.id, campaignId: c.id, creatorId: app.creatorId, media: app.media,
-      url: d.url, title: d.title, body: d.body, checklist: d.checklist, result: result });
+    var prev = Store.reviewOf(app.id);
+    var insight = {
+      visitors: d.visitors === '' || d.visitors == null ? null : Number(d.visitors),
+      likes: d.likes === '' || d.likes == null ? null : Number(d.likes),
+      comments: d.comments === '' || d.comments == null ? null : Number(d.comments)
+    };
+    if (prev && prev.adminStatus !== 'passed') {
+      Store.resubmitReview(prev.id, { url: d.url, title: d.title, body: d.body, checklist: d.checklist, result: result,
+        visitors: insight.visitors != null ? insight.visitors : prev.visitors,
+        likes: insight.likes != null ? insight.likes : prev.likes,
+        comments: insight.comments != null ? insight.comments : prev.comments });
+    } else {
+      Store.addReview({ appId: app.id, campaignId: app.campaignId, creatorId: app.creatorId, media: app.media,
+        url: d.url, title: d.title, body: d.body, checklist: d.checklist, result: result,
+        visitors: insight.visitors, likes: insight.likes, comments: insight.comments });
+    }
     App.reviewDraft = null;
     App.render();
     setTimeout(function () { App.openModal(ViewMy.resultModal(app), { size: 'narrow' }); }, 60);
@@ -5126,19 +5728,190 @@ var App = {
     App.mannerStars = 0;
     App.openModal(ViewAdmin.applicantModal(a), { size: 'narrow' });
   },
+  /* ------------------------------------------------------ 가이드 · 복사 -- */
+  copyField: function (targetId, msg) {
+    var el = document.getElementById(targetId);
+    if (!el) { App.toast('복사할 내용을 찾지 못했습니다.', true); return; }
+    var text = el.value != null ? el.value : el.textContent;
+    U.copy(String(text), msg || '복사했습니다.');
+  },
+  openGuideline: function (id) {
+    var a = Store.app(id);
+    if (!a) return;
+    App.openModal(ViewMy.guideline(a), { size: '' });
+  },
+
+  /* ------------------------------------------------- 관리자 선정 · 배정 -- */
+  selectMessage: function (a, c, visitAt, visitTime, keyword) {
+    var cr = Store.creator(a.creatorId) || {};
+    var g = Store.guideline({ campaignId: c.id, visitAt: visitAt || a.visitAt, visitTime: visitTime || a.visitTime, assignedKeyword: keyword, id: a.id });
+    var lines = [
+      '[' + Store.brand(c.brand).name + '] ' + c.store + ' · ' + c.campaignName + ' 선정 안내',
+      '안녕하세요 ' + (cr.name || a.name) + '님, ' + ORG.ko + '입니다.',
+      '신청하신 체험단에 선정되셨습니다. 아래 일정으로 방문해 주세요.',
+      '',
+      '· 확정 방문일시: ' + (visitAt ? U.fmtFull(visitAt) + ' ' + (visitTime || '') : '매장과 협의 후 확정') + ' (' + (a.companions || 1) + '명)',
+      '· 매장 주소: ' + (g.address || c.area || ''),
+      '· 제공 내역: ' + c.provide,
+      '· 배정 키워드: ' + (keyword || c.keywords.main) + (keyword ? ' (메인: ' + c.keywords.main + ')' : ''),
+      '· 해시태그: ' + (c.keywords.tags || []).join(' '),
+      '· 포스팅 마감: ' + g.postDue + ' (' + g.postDays + '일 이내)',
+      '· 촬영·작성: ' + ((c.mission && c.mission.items) || []).join(' / '),
+      '',
+      '방문이 어려우시면 24시간 전까지 알려 주세요. 가이드라인은 메이트립 [내 활동]에서도 확인할 수 있습니다.',
+      '감사합니다.'
+    ];
+    return lines.join('\n');
+  },
+  openSelect: function (id) {
+    var a = Store.app(id);
+    if (!a) return;
+    App.selectId = id;
+    var c = Store.campaign(a.campaignId) || {};
+    var defDate = a.visitAt || (Store.visitRange(c) || {}).min || U.iso(U.today());
+    var defKw = a.assignedKeyword || (c.keywords.subs || [])[0] || '';
+    var times = ViewExplore.timeOptions(c);
+    var msg = App.selectMessage(a, c, defDate, a.visitTime || '', defKw);
+    App.openModal('<div class="m-pad"><div class="m-head"><span class="eyebrow">' + icon('check') + 'SELECT</span>' +
+      '<h2 style="margin-top:8px">선정 · 방문일시 배정</h2>' +
+      '<p class="sub">' + U.esc((Store.creator(a.creatorId) || {}).name || a.name) + ' · ' + U.esc(c.store) + ' · ' + U.esc(c.campaignName) + '</p></div>' +
+      '<form id="selectForm" data-id="' + id + '"><div class="form-grid">' +
+        '<div class="field"><label for="selDate">확정 방문일 <span class="req">*</span></label>' +
+          '<input class="input" id="selDate" type="date" value="' + U.esc(defDate) + '" min="' + U.iso(U.today()) + '"></div>' +
+        '<div class="field"><label for="selTime">확정 시간 ' + (c.visitType === 'free' ? '<span class="tiny">(자유방문)</span>' : '<span class="req">*</span>') + '</label>' +
+          '<select class="input" id="selTime">' + (a.visitTime ? '' : '<option value="">시간 선택</option>') + times + '</select></div>' +
+        '<div class="field full"><label for="selKeyword">개별 배정 키워드</label>' +
+          '<input class="input" id="selKeyword" value="' + U.esc(defKw) + '" list="selKwList" placeholder="예: 대구 교동 술집">' +
+          '<span class="hint">검수 시 필수 키워드로 추가됩니다. 비우면 메인 키워드만 적용됩니다.</span></div>' +
+      '</div>' +
+      '<datalist id="selKwList">' + [c.keywords.main].concat(c.keywords.subs || []).map(function (k) { return '<option value="' + U.esc(k) + '">'; }).join('') + '</datalist>' +
+      '<div class="settings-sec"><h3>' + icon('send') + '선정 · 가이드 안내 문구</h3>' +
+        '<textarea id="selMsg" rows="9" style="font-size:12px;line-height:1.7">' + U.esc(msg) + '</textarea>' +
+        '<div style="display:flex;gap:6px;margin-top:7px;flex-wrap:wrap">' +
+          '<button class="btn btn-ghost btn-sm" type="button" data-act="copyField" data-target="selMsg" data-msg="선정 안내 문구를 복사했습니다.">' + icon('copy') + '문구 복사</button>' +
+          '<span class="tiny" style="align-self:center">카톡·문자로 바로 붙여넣어 보내세요.</span></div></div>' +
+      '<div class="notice" style="margin-top:10px;font-size:11.5px">' + icon('info') + ' <span style="margin-left:4px">선정하면 확정 일시·키워드가 블로거 [내 활동 → 가이드라인]에 바로 표시됩니다.</span></div>' +
+      '<div class="m-foot" style="padding:14px 0 0;border:0"><button class="btn btn-ghost" type="button" data-act="closeModal">취소</button>' +
+        '<button class="btn btn-primary" type="button" data-act="doSelect" data-id="' + id + '">' + icon('check') + '선정 처리 + 문구 복사</button></div></form></div>', { size: '' });
+    setTimeout(function () {
+      ['selDate', 'selTime', 'selKeyword'].forEach(function (fid) {
+        var el = document.getElementById(fid);
+        if (!el) return;
+        var sync = function () {
+          var ta = document.getElementById('selMsg');
+          var app = Store.app(id);
+          if (!ta || !app) return;
+          ta.value = App.selectMessage(app, Store.campaign(app.campaignId) || {},
+            (document.getElementById('selDate') || {}).value, (document.getElementById('selTime') || {}).value,
+            String((document.getElementById('selKeyword') || {}).value || '').trim());
+        };
+        el.addEventListener('change', sync);
+        el.addEventListener('input', sync);
+      });
+    }, 40);
+  },
+  doSelect: function (id) {
+    var a = Store.app(id);
+    if (!a) return;
+    var d = (document.getElementById('selDate') || {}).value || '';
+    var t = (document.getElementById('selTime') || {}).value || '';
+    var kw = ((document.getElementById('selKeyword') || {}).value || '').trim();
+    if (!d) { App.toast('확정 방문일을 선택해 주세요.', true); return; }
+    var c = Store.campaign(a.campaignId) || {};
+    if (c.visitType !== 'free' && !t) { App.toast('확정 시간을 선택해 주세요.', true); return; }
+    var keep = ['visited', 'submitted', 'passed', 'fix'].indexOf(a.status) >= 0 ? a.status : 'selected';
+    Store.setAppAssign(id, { visitAt: d, visitTime: t, assignedKeyword: kw, status: keep, guideSentAt: new Date().toISOString() });
+    var msg = App.selectMessage(a, c, d, t, kw);
+    App.closeModal();
+    App.adminSelected = [];
+    App.adminApps.status = '';
+    App.render();
+    U.copy(msg, '선정 처리했습니다. 안내 문구를 복사했으니 카톡·문자로 보내세요.');
+  },
+  openBulkSelect: function () {
+    if (!App.adminSelected.length) return;
+    var rows = App.adminSelected.map(function (id) { return Store.app(id); }).filter(Boolean);
+    if (!rows.length) return;
+    var c = Store.campaign(rows[0].campaignId) || {};
+    var defDate = (Store.visitRange(c) || {}).min || U.iso(U.today());
+    App.openModal('<div class="m-pad"><div class="m-head"><h2>일괄 선정 · ' + rows.length + '명</h2>' +
+      '<p class="sub">방문일을 공통으로 배정합니다. 개별 키워드는 신청자별로 선정 모달에서 따로 지정할 수 있습니다.</p></div>' +
+      '<div class="form-grid"><div class="field"><label for="bulkDate">확정 방문일</label><input class="input" id="bulkDate" type="date" value="' + defDate + '" min="' + U.iso(U.today()) + '"></div>' +
+      '<div class="field"><label for="bulkTime">확정 시간</label><select class="input" id="bulkTime"><option value="">시간 선택</option>' + ViewExplore.timeOptions(c) + '</select></div></div>' +
+      '<div class="notice" style="margin-top:10px;font-size:11.5px">' + icon('info') + ' <span style="margin-left:4px">시간을 비우고 선정하면 이후 개별 배정에서 채울 수 있습니다.</span></div>' +
+      '<div class="form-actions" style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">' +
+        '<button class="btn btn-ghost" type="button" data-act="closeModal">취소</button>' +
+        '<button class="btn btn-primary" type="button" data-act="doBulkSelect">' + icon('check') + '일괄 선정</button></div></div>', { size: 'narrow' });
+  },
+  doBulkSelect: function () {
+    var d = (document.getElementById('bulkDate') || {}).value || '';
+    var t = (document.getElementById('bulkTime') || {}).value || '';
+    if (!d) { App.toast('확정 방문일을 선택해 주세요.', true); return; }
+    var n = App.adminSelected.length;
+    App.adminSelected.forEach(function (id) { Store.setAppAssign(id, { visitAt: d, visitTime: t, status: 'selected' }); });
+    App.adminSelected = [];
+    App.closeModal();
+    App.render();
+    App.toast(n + '명을 선정했습니다. 개별 키워드·안내 문구는 각 신청 상세에서 보낼 수 있습니다.');
+  },
+
+  saveInsight: function (reviewId) {
+    var rv = Store.state.reviews.filter(function (r) { return r.id === reviewId; })[0];
+    if (!rv) return;
+    var num = function (id) {
+      var v = (document.getElementById(id) || {}).value;
+      if (v === undefined || String(v).trim() === '') return null;
+      var n = Number(String(v).replace(/[^0-9]/g, ''));
+      return isNaN(n) ? null : n;
+    };
+    var ranks = [];
+    var map = {};
+    Array.prototype.forEach.call(document.querySelectorAll('[data-rank-kw]'), function (el) {
+      var kw = el.getAttribute('data-rank-kw');
+      var rec = map[kw] || (map[kw] = { kw: kw, rank: null, blog: null });
+      var v = String(el.value == null ? '' : el.value).trim();
+      if (v === '') return;
+      var n = Number(v.replace(/[^0-9]/g, ''));
+      if (isNaN(n)) return;
+      if (el.getAttribute('data-rank-kind') === 'total') rec.rank = n;
+      else rec.blog = n;
+    });
+    Object.keys(map).forEach(function (k) {
+      var r = map[k];
+      if (r.rank != null || r.blog != null) ranks.push(r);
+    });
+    Store.setReviewInsight(reviewId, {
+      visitors: num('insVisitors'), likes: num('insLikes'), comments: num('insComments'), photos: num('insPhotos'), ranks: ranks
+    });
+    App.render();
+    App.toast('인사이트를 저장했습니다. 성과 보고서에 바로 반영됩니다.');
+  },
+  addFixChip: function (text) {
+    var ta = document.getElementById('fixText');
+    if (!ta || !text) return;
+    var cur = ta.value.replace(/\s+$/, '');
+    if (cur.indexOf(text) >= 0) { App.toast('이미 추가된 항목입니다.'); return; }
+    ta.value = cur + (cur ? '\n' : '') + '· ' + text;
+  },
+
   reviewDecision: function (id, status) {
     var rv = Store.state.reviews.filter(function (r) { return r.id === id; })[0];
     if (!rv) return;
     var noteEl = document.getElementById('adminNote');
-    var note = noteEl && noteEl.value.trim() ? noteEl.value.trim() : (rv.adminNote || '');
-    if (status !== 'passed' && !note) {
-      var res = rv.result || Inspector.run({ media: rv.media, url: rv.url, title: rv.title, body: rv.body, checklist: rv.checklist }, Store.campaign(rv.campaignId));
-      note = res.fixes.join('\n');
+    var fixEl = document.getElementById('fixText');
+    var note = '';
+    if (status === 'passed') note = noteEl && noteEl.value.trim() ? noteEl.value.trim() : (rv.adminNote || '');
+    else {
+      note = (fixEl && fixEl.value.trim()) || (noteEl && noteEl.value.trim()) || '';
+      if (!note) {
+        var res = rv.result || Inspector.run({ media: rv.media, url: rv.url, title: rv.title, body: rv.body, checklist: rv.checklist }, Store.campaign(rv.campaignId));
+        note = res.fixes.join('\n');
+      }
     }
     Store.setReviewStatus(id, status, note);
     App.adminReviewFilter = status === 'passed' ? 'passed' : 'fix';
     App.render();
-    App.toast(status === 'passed' ? '검수 통과 처리했습니다.' : '수정 요청을 기록했습니다. 문구를 복사해 전달하세요.');
+    App.toast(status === 'passed' ? '검수 통과 처리했습니다.' : '수정 요청을 기록했습니다. 블로거 [내 활동]에 사유가 표시됩니다.');
   },
   copyFixes: function (id) {
     var rv = id ? Store.state.reviews.filter(function (r) { return r.id === id; })[0] : null;
@@ -5205,57 +5978,99 @@ var App = {
   saveCampaign: function (form) {
     var c = Store.campaign(form.getAttribute('data-id'));
     if (!c) return;
-    var name = (document.getElementById('ecName') || {}).value || '';
-    var main = (document.getElementById('ecMain') || {}).value || '';
-    var cap = Number((document.getElementById('ecCap') || {}).value || 0);
-    var provide = (document.getElementById('ecProvide') || {}).value || '';
-    var days = Number((document.getElementById('ecDays') || {}).value || 0);
-    var status = (document.getElementById('ecStatus') || {}).value || 'open';
+    var val = function (id) { var el = document.getElementById(id); return el ? el.value : ''; };
+    var lines = function (id) { return String(val(id) || '').split('\n').map(function (x) { return x.trim(); }).filter(Boolean); };
+    var commas = function (id) { return String(val(id) || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); };
+    var name = val('ecName');
+    var main = val('ecMain');
+    var cap = Number(val('ecCap') || 0);
+    var provide = val('ecProvide');
+    var days = Number(val('ecDays') || 0);
+    var status = val('ecStatus') || 'open';
     if (!name.trim() || !main.trim()) { App.toast('캠페인명과 메인 키워드를 입력해 주세요.', true); return; }
     var cur = Store.capacityOf(c);
     c.campaignName = name.trim();
     c.keywords.main = main.trim();
+    c.keywords.subs = commas('ecSubs');
+    c.keywords.tags = commas('ecTags');
     c.provide = provide.trim() || c.provide;
     c.status = status;
+    c.area = val('ecArea').trim() || c.area;
+    c.address = val('ecAddress').trim() || c.address;
+    c.hours = { open: val('ecOpen') || (c.hours || {}).open, close: val('ecClose') || (c.hours || {}).close };
+    var bFrom = val('ecBlockFrom'), bTo = val('ecBlockTo');
+    var oldBlock = (c.blocked || []).slice(1);
+    c.blocked = (bFrom && bTo) ? [{ from: bFrom, to: bTo, label: val('ecBlockLabel').trim() || '제외 시간' }].concat(oldBlock) : oldBlock;
+    c.mission = c.mission || {};
+    c.mission.minPhotos = Number(val('ecMinPhotos') || 0);
+    c.mission.minChars = Number(val('ecMinChars') || 0);
+    c.mission.items = lines('ecMission');
+    c.mission.receipt = !!(document.getElementById('ecReceipt') || {}).checked;
+    c.mission.postDays = Number(val('ecPostDays') || 7);
+    c.postDays = c.mission.postDays;
+    c.disclosure = val('ecDisclosure').trim();
+    c.notes = lines('ecNotes');
     if (days > 0) { c.deadlineInDays = days; c.deadline = ''; }
     var cs = Store.state.campaignState[c.id] || {};
     cs.capacity = U.clamp(cap, cur.confirmed, 60);
     Store.state.campaignState[c.id] = cs;
     Store.save();
     if (DB.configured()) {
-      DB.update('campaigns', c.id, { campaign_name: c.campaignName, main_keyword: c.keywords.main,
-        provide: c.provide, status: c.status, capacity: cs.capacity, confirmed: cur.confirmed });
+      DB.update('campaigns', c.id, {
+        campaign_name: c.campaignName, main_keyword: c.keywords.main, sub_keywords: c.keywords.subs,
+        provide: c.provide, status: c.status, capacity: cs.capacity, confirmed: cur.confirmed,
+        address: c.address || '', area: c.area || '', hours_open: c.hours.open || '', hours_close: c.hours.close || '',
+        blocked: c.blocked || [], disclosure: c.disclosure || '', min_photos: c.mission.minPhotos,
+        min_chars: c.mission.minChars, receipt: c.mission.receipt, post_days: c.mission.postDays,
+        mission_items: c.mission.items || [], notes: c.notes || []
+      });
     }
     App.closeModal(); App.render();
-    App.toast(c.id + ' 캠페인을 수정했습니다.');
+    App.toast(c.id + ' 캠페인을 수정했습니다. 가이드라인도 함께 갱신됩니다.');
   },
 
   createCampaign: function (form) {
-    var brand = (document.getElementById('ncBrand') || {}).value || 'wagzag';
-    var store = (document.getElementById('ncStore') || {}).value || '';
-    var name = (document.getElementById('ncName') || {}).value || '';
-    var main = (document.getElementById('ncMain') || {}).value || '';
-    var cap = Number((document.getElementById('ncCap') || {}).value || 5);
-    var provide = (document.getElementById('ncProvide') || {}).value || '';
-    var days = Number((document.getElementById('ncDays') || {}).value || 14);
+    var val = function (id) { var el = document.getElementById(id); return el ? el.value : ''; };
+    var brand = val('ncBrand') || 'wagzag';
+    var store = val('ncStore');
+    var name = val('ncName');
+    var main = val('ncMain');
+    var cap = Number(val('ncCap') || 5);
+    var provide = val('ncProvide');
+    var days = Number(val('ncDays') || 14);
+    var subs = String(val('ncSubs') || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
     if (!store.trim() || !name.trim() || !main.trim()) { App.toast('매장명·캠페인명·메인 키워드를 입력해 주세요.', true); return; }
     var id = 'CMP-' + String(CAMPAIGNS.length + 1).padStart(3, '0');
     var b = Store.brand(brand);
     CAMPAIGNS.push({
       id: id, brand: brand, store: store.trim(), campaignName: name.trim(), tagline: '새로 등록한 캠페인입니다.',
-      region: '대구', area: '대구', category: b.category, media: ['blog'], visitType: 'reserved', status: 'open',
+      region: '대구', area: '대구', address: val('ncAddress').trim(), category: b.category, media: ['blog'], visitType: 'reserved', status: 'open',
       hours: { open: '11:00', close: '22:00' }, hoursConfirmed: false, blocked: [],
       visitWindow: '등록 후 확정', provide: provide || '시그니처 메뉴 2인',
       gradeBenefit: { black: 100, diamond: 100, red: 100, yellow: 50 }, points: 8000,
-      capacity: cap, confirmed: 0, deadlineInDays: days,
-      keywords: { main: main.trim(), subs: [], tags: ['#' + b.name] },
-      mission: { minPhotos: 6, minChars: 700, receipt: false, items: ['음식·공간 사진 6장 이상'] },
+      capacity: cap, confirmed: 0, deadlineInDays: days, postDays: 7,
+      keywords: { main: main.trim(), subs: subs, tags: ['#' + b.name] },
+      mission: { minPhotos: Number(val('ncMinPhotos') || 6), minChars: 700, receipt: false, postDays: 7, items: ['음식·공간 사진 6장 이상'] },
+      disclosure: val('ncDisclosure').trim(),
       fit: ['매장 리뷰를 쓰는 블로거'], notes: ['영업시간·제외 시간은 확정 후 입력해 주세요.'],
       suggestedKeywords: true
     });
     App.closeModal();
     Store.state.ui.mode = 'admin'; Store.state.ui.adminTab = 'campaigns';
     App.render();
+    if (DB.configured()) {
+      var nc = Store.campaign(id);
+      DB.insert('campaigns', {
+        id: nc.id, brand: nc.brand, store: nc.store, campaign_name: nc.campaignName, region: nc.region,
+        category: nc.category, media: nc.media, visit_type: nc.visitType, status: nc.status,
+        capacity: nc.capacity, confirmed: nc.confirmed, provide: nc.provide, visit_window: nc.visitWindow,
+        hours_open: nc.hours.open, hours_close: nc.hours.close, main_keyword: nc.keywords.main,
+        sub_keywords: nc.keywords.subs, address: nc.address || '', area: nc.area || '',
+        blocked: nc.blocked || [], disclosure: nc.disclosure || '', min_photos: nc.mission.minPhotos,
+        min_chars: nc.mission.minChars, receipt: !!nc.mission.receipt, post_days: nc.mission.postDays || 7,
+        mission_items: nc.mission.items || [], notes: nc.notes || []
+      }).then(function (row) { if (row) App.toast(id + ' 캠페인을 Supabase에 저장했습니다.'); });
+    }
     App.toast(id + ' 캠페인을 등록했습니다. (데모 저장)');
   },
 
