@@ -2974,11 +2974,12 @@ var ViewIndex = {
     var dots = pts.map(function (p) {
       return '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="3.4" fill="#FF3B5C" stroke="#fff" stroke-width="1.6"/>';
     }).join('');
+    var short = { visitors: '일방문자', posts: '발행량', rank: '상위노출', reaction: '반응률' };
     var labels = axes.map(function (it, i) {
       var a = (-90 + i * 90) * Math.PI / 180;
-      var lx = cx + Math.cos(a) * (R + 26), ly = cy + Math.sin(a) * (R + 22);
+      var lx = cx + Math.cos(a) * (R + 18), ly = cy + Math.sin(a) * (R + 18);
       var anchor = Math.abs(Math.cos(a)) < 0.2 ? 'middle' : (Math.cos(a) > 0 ? 'start' : 'end');
-      return '<text x="' + lx.toFixed(1) + '" y="' + ly.toFixed(1) + '" text-anchor="' + anchor + '" style="font-size:10.5px;font-weight:900;fill:#384152">' + U.esc(it.label) + '</text>' +
+      return '<text x="' + lx.toFixed(1) + '" y="' + ly.toFixed(1) + '" text-anchor="' + anchor + '" style="font-size:10.5px;font-weight:900;fill:#384152">' + U.esc(short[it.key] || it.label) + '</text>' +
         '<text x="' + lx.toFixed(1) + '" y="' + (ly + 12).toFixed(1) + '" text-anchor="' + anchor + '" style="font-size:9px;fill:#8B93A3">' +
         (it.got == null ? '미확인' : it.got + '/' + it.max) + '</text>';
     }).join('');
@@ -3012,7 +3013,7 @@ var ViewIndex = {
     var g = res.meta;
     var tone = g.tone;
     var badge = '<span class="sim-badge' + (res.simulated ? '' : ' live') + '">' + icon(res.simulated ? 'alert' : 'check') +
-      (res.simulated ? '시뮬레이션 결과 · 미등록 블로그' : '등록 블로거 실측 기반') + '</span>';
+      (res.simulated ? '시뮬레이션 · 미등록 블로그' : '등록 블로거 지표 기반') + '</span>';
     var axes = res.items.map(function (it) {
       var pctv = it.got == null ? 0 : Math.round(it.got / it.max * 100);
       return '<div class="axis">' +
