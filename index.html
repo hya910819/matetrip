@@ -694,6 +694,7 @@ table.mini td.num{text-align:right;font-variant-numeric:tabular-nums}
 .sh-kpi b small{font-size:10px;color:var(--ink-3);font-weight:800;margin-left:1px}
 .sh-kpi em{display:block;font-style:normal;font-size:9.5px;color:var(--muted);font-weight:700;margin-top:2px}
 table.rep{font-size:10.5px;min-width:0}
+.rep-scroll{overflow-x:auto;scrollbar-width:thin;-webkit-overflow-scrolling:touch}
 table.rep th{padding:6px 6px;font-size:9px;text-align:left;font-weight:900;color:var(--muted);letter-spacing:.02em;background:var(--surface);
   border-bottom:1px solid var(--line);white-space:nowrap}
 table.rep td{padding:6px;border-bottom:1px solid var(--line-2);vertical-align:top;line-height:1.45}
@@ -858,6 +859,7 @@ table.rep .kw{font-size:9.5px;color:var(--ink-3)}
   .sh-sec{break-inside:auto;page-break-inside:auto;margin-top:10pt}
   .sh-kpis,.sh-two,.chart-legend{break-inside:avoid;page-break-inside:avoid}
   table.rep,table.tbl{font-size:8pt}
+  .rep-scroll{overflow:visible!important}
   table.rep{page-break-inside:auto}
   table.rep tr{page-break-inside:avoid}
   .sh-foot{break-inside:avoid}
@@ -4138,7 +4140,7 @@ var ViewReport = {
       return '<div class="rep-empty"><b style="font-size:13px">아직 발행된 포스팅이 없습니다</b>' +
         '<p class="tiny" style="margin-top:4px">검수가 끝난 포스팅이 생기면 자동으로 표에 채워집니다.</p></div>';
     }
-    return '<table class="rep"><thead><tr>' +
+    return '<div class="rep-scroll"><table class="rep"><thead><tr>' +
       '<th style="width:22px">No</th><th>블로거</th><th>방문</th><th>발행</th><th>사용 키워드</th>' +
       '<th class="num">일방문자</th><th class="num">공감</th><th class="num">댓글</th><th class="num">사진</th><th>노출</th><th>포스팅</th>' +
       '</tr></thead><tbody>' + rep.posts.map(function (p) {
@@ -4161,11 +4163,11 @@ var ViewReport = {
       '<td class="num" style="font-weight:900">' + U.fmtNum(rep.totals.likes) + '</td>' +
       '<td class="num" style="font-weight:900">' + U.fmtNum(rep.totals.comments) + '</td>' +
       '<td class="num" style="font-weight:900">' + U.fmtNum(rep.totals.photos) + '</td>' +
-      '<td colspan="2"></td></tr></tfoot></table>';
+      '<td colspan="2"></td></tr></tfoot></table></div>';
   },
 
   keywordTable: function (rep) {
-    return '<table class="rep"><thead><tr><th>키워드</th><th class="num">사용 포스팅</th><th>상위노출</th></tr></thead><tbody>' +
+    return '<div class="rep-scroll"><table class="rep"><thead><tr><th>키워드</th><th class="num">사용 포스팅</th><th>상위노출</th></tr></thead><tbody>' +
       rep.keywords.map(function (k) {
         var ranked = (k.ranked || []);
         return '<tr><td><b style="font-weight:800">' + U.esc(k.kw) + '</b></td>' +
@@ -4173,7 +4175,7 @@ var ViewReport = {
           '<td>' + (ranked.length
             ? ranked.map(function (r) { return '<span class="rank-pill' + (r[1] <= 15 ? ' top' : '') + '" style="margin-right:3px">' + U.esc(r[0]) + ' ' + r[1] + '위</span>'; }).join('')
             : '<span class="rank-pill none">30위 내 미노출</span>') + '</td></tr>';
-      }).join('') + '</tbody></table>' +
+      }).join('') + '</tbody></table></div>' +
       '<p class="sh-note">· 네이버 블로그 검색 노출 기준(2026-11-26 실측). 순위는 검색 환경·개인화에 따라 달라질 수 있습니다.</p>';
   },
 
